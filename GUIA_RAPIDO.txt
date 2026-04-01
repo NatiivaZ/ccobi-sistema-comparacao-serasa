@@ -1,0 +1,51 @@
+═══════════════════════════════════════════════════════════════
+   SISTEMA DE ANÁLISE SERASA × DÍVIDA ATIVA
+   Guia Rápido de Uso
+═══════════════════════════════════════════════════════════════
+
+🚀 INÍCIO RÁPIDO
+───────────────────────────────────────────────────────────────
+
+1. INSTALAÇÃO (apenas na primeira vez):
+   
+   Opção A - Automática (Windows):
+   • Clique duas vezes no arquivo "iniciar.bat"
+   
+   Opção B - Manual:
+   • Abra o PowerShell ou Prompt de Comando
+   • Navegue até a pasta do sistema
+   • Execute: pip install -r requirements.txt
+   • Execute: streamlit run app.py
+
+2. USO DO SISTEMA:
+   
+   • O navegador abrirá automaticamente
+   • Na barra lateral esquerda:
+     - Faça upload da planilha SERASA
+     - Faça upload da planilha Dívida Ativa
+   
+   • Configure os nomes das colunas:
+     - CPF/CNPJ (ex: "CPF_CNPJ", "CPF", "CNPJ")
+     - Valor (ex: "VALOR", "Valor Total")
+     - Vencimento (ex: "VENCIMENTO", "Data Vencimento")
+   
+   • Clique em "🚀 Executar Análise Completa"
+   
+   • Explore os resultados nas abas:
+     - Dashboard com métricas e gráficos
+     - Análise detalhada
+     - Agrupamento por CPF/CNPJ
+     - Separação por valores
+     - Divergências
+     - Exportação de planilhas
+
+3. EXPORTAÇÃO:
+   
+   • Vá para a aba "📥 Exportação"
+   • Clique nos botões de download
+   • As planilhas serão salvas automaticamente
+
+═══════════════════════════════════════════════════════════════
+FORMATOS SUPORTADOS: Excel (.xlsx, .xls) e CSV (.csv)
+═══════════════════════════════════════════════════════════════
+
