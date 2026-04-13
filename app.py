@@ -3,12 +3,28 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime, date, timedelta
-import io
+from datetime import datetime
 import json
-from pathlib import Path
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.styles.numbers import FORMAT_NUMBER_COMMA_SEPARATED2
+import hashlib
+import sqlite3
+
+from utils import (
+    normalizar_cpf_cnpj, normalizar_auto, converter_valor_sql,
+    formatar_cpf_cnpj_brasileiro, formatar_valor_br,
+    normalizar_e_mesclar_modais, resolver_coluna_vencimento,
+)
+from classificacao import (
+    DEFAULT_CLASSIFICACAO_CONFIG,
+    carregar_config_classificacao, salvar_config_classificacao,
+    parse_lista_multilinha, obter_config_classificacao_ativa,
+    classificar_autuado_detalhado,
+    filtrar_autuados_cobraveis, set_session_config_getter,
+)
+from decadencia import (
+    calcular_situacao_decadente, _resolver_coluna_data,
+)
+from exportacao import gerar_excel_formatado
+from historico_db import save_run, list_runs, get_run, excluir_run
 
 # Configuração da página
 st.set_page_config(
@@ -143,58 +159,22 @@ with st.sidebar:
         help="Digite o nome exato da coluna que contém os modais na base Dívida Ativa"
     )
 
+    st.markdown("#### 📅 Ano de Análise")
+    ano_analise = st.number_input(
+        "Ano de vencimento para filtro",
+        min_value=2020,
+        max_value=2035,
+        value=datetime.now().year,
+        step=1,
+        help="Ano usado para filtrar autos por data de vencimento (ex: 01/01/ANO a 31/12/ANO)"
+    )
+
     st.markdown("#### 👤 Classificação de Autuados (exportação base SERASA)")
     coluna_nome_autuado = st.text_input(
         "Nome da coluna do autuado (SERASA)",
         value="Nome Autuado",
         help="Coluna usada para classificar se o autuado pode ou não ser cobrado (órgãos, bancos, leasing)"
     )
-
-CONFIG_CLASSIFICACAO_PATH = Path(__file__).with_name("config_classificacao_autuados.json")
-
-DEFAULT_CLASSIFICACAO_CONFIG = {
-    "extras_orgao": [],
-    "extras_banco": [],
-    "extras_leasing": [],
-    "excecoes_pode_cobrar": [],
-}
-
-EXCECOES_FIXAS_PODE_COBRAR = ["SAFRA"]
-
-def carregar_config_classificacao():
-    """Carrega configurações persistidas da classificação de autuados."""
-    try:
-        if CONFIG_CLASSIFICACAO_PATH.exists():
-            data = json.loads(CONFIG_CLASSIFICACAO_PATH.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                config = DEFAULT_CLASSIFICACAO_CONFIG.copy()
-                for chave in config.keys():
-                    valor = data.get(chave, [])
-                    config[chave] = valor if isinstance(valor, list) else []
-                return config
-    except Exception:
-        pass
-    return DEFAULT_CLASSIFICACAO_CONFIG.copy()
-
-def salvar_config_classificacao(config):
-    """Salva configurações persistidas da classificação de autuados."""
-    config_limpo = {}
-    for chave, valor in DEFAULT_CLASSIFICACAO_CONFIG.items():
-        itens = config.get(chave, valor)
-        if not isinstance(itens, list):
-            itens = []
-        itens = [str(v).strip() for v in itens if str(v).strip()]
-        config_limpo[chave] = itens
-    CONFIG_CLASSIFICACAO_PATH.write_text(
-        json.dumps(config_limpo, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
-
-def parse_lista_multilinha(texto):
-    """Converte textarea em lista de termos."""
-    if not texto:
-        return []
-    return [linha.strip() for linha in str(texto).splitlines() if linha.strip()]
 
 if "classificacao_config" not in st.session_state:
     st.session_state["classificacao_config"] = carregar_config_classificacao()
@@ -266,546 +246,13 @@ def carregar_dados(arquivo, nome_base):
         st.error(f"Erro ao carregar {nome_base}: {str(e)}")
         return None
 
-# Função para normalizar CPF/CNPJ
-def normalizar_cpf_cnpj(valor):
-    if pd.isna(valor):
-        return None
-    # Remove caracteres não numéricos
-    valor_str = str(valor).replace('.', '').replace('-', '').replace('/', '').strip()
-    return valor_str if valor_str else None
+# Registrar getter de config de classificação com session_state do Streamlit
+set_session_config_getter(lambda: st.session_state.get("classificacao_config"))
 
-# Função para normalizar Auto de Infração
-def normalizar_auto(valor):
-    """
-    Normaliza o valor do Auto de Infração para comparação exata.
-    Remove espaços, converte para maiúsculas e garante que seja string.
-    """
-    if pd.isna(valor):
-        return None
-    # Converter para string, remover espaços no início e fim, e converter para maiúsculas
-    valor_str = str(valor).strip().upper()
-    # Remover espaços múltiplos internos (caso existam)
-    valor_str = ' '.join(valor_str.split())
-    return valor_str if valor_str else None
-
-# Função para converter valores como no SQL (limpeza completa)
-def converter_valor_sql(valor):
-    """
-    Converte valor de texto para decimal seguindo a mesma lógica do SQL:
-    TRY_CONVERT(decimal(18,2), REPLACE(REPLACE(REPLACE(REPLACE([Valor], 'R$', ''), ' ', ''), '.', ''), ',', '.'))
-
-    ATENÇÃO: Se o valor já for numérico (int/float), retorna diretamente SEM
-    manipulação de string, evitando o bug onde "241.11" → remove '.' → "24111"
-    (100x maior). Esse bug ocorre quando a coluna da SERASA é lida pelo pandas
-    como float, enquanto a da Dívida era texto formatado em BR ("R$ 241,11").
-    """
-    if pd.isna(valor):
-        return None
-    # Se já é número (Excel leu como float/int), retorna direto — não há vírgula/ponto a tratar
-    if isinstance(valor, (int, float)):
-        return float(valor)
-    try:
-        valor_str = str(valor).strip()
-        # Remover R$
-        valor_str = valor_str.replace('R$', '').replace('r$', '').replace('R$', '')
-        # Remover espaços
-        valor_str = valor_str.replace(' ', '')
-        # Checar se é formato BR (tem vírgula como decimal): "1.234,56" ou "241,11"
-        # Nesse caso: remover pontos (milhar) e trocar vírgula por ponto decimal
-        if ',' in valor_str:
-            valor_str = valor_str.replace('.', '')
-            valor_str = valor_str.replace(',', '.')
-        # Se não tem vírgula, pode ser já no padrão EN ("241.11") ou inteiro — não mexer nos pontos
-        return float(valor_str)
-    except:
-        return None
-
-# Função para resolver coluna de vencimento com variações de nome e sufixo
-def resolver_coluna_vencimento(df, coluna_vencimento):
-    if df is None or df.empty:
-        return None
-    colunas = list(df.columns)
-    colunas_map = {c.lower(): c for c in colunas}
-
-    candidatos = []
-    if coluna_vencimento:
-        candidatos.append(coluna_vencimento)
-        if " do " in coluna_vencimento:
-            candidatos.append(coluna_vencimento.replace(" do ", " de "))
-        if " de " in coluna_vencimento:
-            candidatos.append(coluna_vencimento.replace(" de ", " do "))
-    candidatos += ["Data de Vencimento", "Data do Vencimento"]
-
-    for cand in candidatos:
-        for sufixo in ["_serasa", "_divida", ""]:
-            chave = f"{cand}{sufixo}".lower()
-            if chave in colunas_map:
-                return colunas_map[chave]
-
-    # Fallback: qualquer coluna que contenha "vencimento"
-    cols_venc = [c for c in colunas if "vencimento" in c.lower()]
-    if cols_venc:
-        for pref in ["serasa", "divida"]:
-            for c in cols_venc:
-                if pref in c.lower():
-                    return c
-        return cols_venc[0]
-
-    return None
-
-# --- Classificação de autuados (não pode cobrar: órgão, banco, leasing) ---
-import re
-import unicodedata
-
-def _normalizar_texto_para_busca(texto):
-    """Remove acentos, padroniza separadores e adiciona espaços nas bordas."""
-    if not texto or (isinstance(texto, float) and pd.isna(texto)):
-        return ""
-    s = unicodedata.normalize("NFD", str(texto).strip().upper())
-    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
-    s = re.sub(r"[^A-Z0-9]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return f" {s} " if s else ""
-
-def _contem_expressao(texto_norm, expressao):
-    """Confere expressao completa, evitando falso positivo por pedaço de palavra."""
-    expr_norm = _normalizar_texto_para_busca(expressao)
-    return bool(expr_norm) and expr_norm in texto_norm
-
-def _contem_alguma_expressao(texto_norm, expressoes):
-    return any(_contem_expressao(texto_norm, expr) for expr in expressoes)
-
-_EXPRESSOES_LEASING = [
-    "LEASING",
-    "ARRENDAMENTO MERCANTIL",
-    "ARREND MERCANTIL",
-    "ARREND. MERCANTIL",
-    "LOCACAO FINANCEIRA",
-    "LOCACAO MERCANTIL",
-]
-
-_EXPRESSOES_ORGAO = [
-    "CORPO DE BOMBEIROS",
-    "BOMBEIRO MILITAR",
-    "POLICIA MILITAR",
-    "POLICIA CIVIL",
-    "POLICIA FEDERAL",
-    "POLICIA RODOVIARIA FEDERAL",
-    "RODOVIARIA FEDERAL",
-    "PRF",
-    "EXERCITO BRASILEIRO",
-    "EXERCITO",
-    "MARINHA DO BRASIL",
-    "MARINHA",
-    "FORCA AEREA BRASILEIRA",
-    "AERONAUTICA",
-    "PREFEITURA MUNICIPAL",
-    "MUNICIPIO DE",
-    "GOVERNO DO ESTADO",
-    "GOVERNO FEDERAL",
-    "RECEITA FEDERAL",
-    "MINISTERIO PUBLICO",
-    "DEFENSORIA PUBLICA",
-    "TRIBUNAL DE",
-    "TRIBUNAL REGIONAL",
-    "CAMARA MUNICIPAL",
-    "SECRETARIA DE ESTADO",
-    "SECRETARIA MUNICIPAL",
-    "MINISTERIO DA",
-    "MINISTERIO DO",
-    "AUTARQUIA",
-    "FUNDACAO PUBLICA",
-    "INSS",
-    "DATAPREV",
-    "IBAMA",
-    "INCRA",
-    "DETRAN",
-    "DEPARTAMENTO ESTADUAL DE TRANSITO",
-    "CORREIOS",
-    "EMPRESA BRASILEIRA DE CORREIOS E TELEGRAFOS",
-    "AGENCIA NACIONAL DE AGUAS",
-    "AGENCIA NACIONAL DE TRANSPORTES TERRESTRES",
-]
-
-_MARCADORES_BANCO = [
-    "BANCO",
-    "BANK",
-    "FINANCEIRA",
-    "INSTITUICAO FINANCEIRA",
-    "SERVICOS FINANCEIROS",
-    "FINANCIAL SERVICES",
-    "CREDITO FINANCIAMENTO E INVESTIMENTO",
-    "COOPERATIVA DE CREDITO",
-]
-
-_NOMES_BANCOS_ESPECIFICOS = [
-    "BANCO DO BRASIL",
-    "CAIXA ECONOMICA FEDERAL",
-    "BANCO DA AMAZONIA",
-    "BANCO DO NORDESTE",
-    "BANCO DE BRASILIA",
-    "BNDES",
-    "BANRISUL",
-    "BANESTES",
-    "BANPARA",
-    "BANESE",
-    "BRADESCO",
-    "SANTANDER",
-    "ITAU UNIBANCO",
-    "ITAU",
-    "BTG PACTUAL",
-    "SAFRA",
-    "CITIBANK",
-    "C6 BANK",
-    "NUBANK",
-    "BANCO INTER",
-    "PAGBANK",
-    "BANCO ORIGINAL",
-    "BANCO PAN",
-    "DAYCOVAL",
-    "SICREDI",
-    "SICOOB",
-    "CRESOL",
-    "AGIBANK",
-    "OMNI BANCO",
-    "PARANA BANCO",
-    "MERCANTIL DO BRASIL",
-    "BANCO SOFISA",
-    "BANCO FIBRA",
-    "BANCO GENIAL",
-    "BANCO MODAL",
-    "BANCO BS2",
-    "DIGIO",
-    "OURIBANK",
-    "TRIBANCO",
-    "ABC BRASIL",
-    "ABN AMRO",
-    "BNP PARIBAS",
-    "BANK OF AMERICA",
-    "SCOTIABANK",
-    "DEUTSCHE BANK",
-    "GOLDMAN SACHS",
-    "JP MORGAN",
-    "MORGAN STANLEY",
-    "HSBC",
-    "RABOBANK",
-    "BMG",
-    "BV",
-]
-
-def obter_config_classificacao_ativa():
-    """Retorna a configuração ativa da classificação de autuados."""
-    config = st.session_state.get("classificacao_config")
-    if not isinstance(config, dict):
-        config = carregar_config_classificacao()
-        st.session_state["classificacao_config"] = config
-    return config
-
-def _lista_regras_classificacao(config):
-    """Monta as listas efetivas de regras combinando defaults + extras."""
-    config = config or DEFAULT_CLASSIFICACAO_CONFIG
-    return {
-        "orgao": _EXPRESSOES_ORGAO + list(config.get("extras_orgao", [])),
-        "banco": _MARCADORES_BANCO + _NOMES_BANCOS_ESPECIFICOS + list(config.get("extras_banco", [])),
-        "leasing": _EXPRESSOES_LEASING + list(config.get("extras_leasing", [])),
-        "excecoes": EXCECOES_FIXAS_PODE_COBRAR + list(config.get("excecoes_pode_cobrar", [])),
-    }
-
-def classificar_autuado_detalhado(nome, config=None):
-    """
-    Retorna (classificacao, motivo, termo_encontrado) para o nome do autuado.
-    """
-    texto_norm = _normalizar_texto_para_busca(nome)
-    if not texto_norm:
-        return "Pode cobrar", "Nome vazio ou não informado", ""
-
-    regras = _lista_regras_classificacao(config or obter_config_classificacao_ativa())
-
-    for termo in regras["excecoes"]:
-        if _contem_expressao(texto_norm, termo):
-            return "Pode cobrar", "Exceção cadastrada", termo
-
-    for termo in regras["leasing"]:
-        if _contem_expressao(texto_norm, termo):
-            return "Não pode cobrar - Leasing", "Correspondência com regra de leasing", termo
-
-    for termo in regras["orgao"]:
-        if _contem_expressao(texto_norm, termo):
-            return "Não pode cobrar - Órgão", "Correspondência com regra de órgão público", termo
-
-    for termo in regras["banco"]:
-        if _contem_expressao(texto_norm, termo):
-            return "Não pode cobrar - Banco", "Correspondência com regra de instituição financeira", termo
-
-    return "Pode cobrar", "Nenhuma regra impeditiva encontrada", ""
-
-def classificar_autuado(nome):
-    """Wrapper simples para manter compatibilidade com chamadas antigas."""
-    classificacao, _, _ = classificar_autuado_detalhado(nome)
-    return classificacao
-
-def filtrar_autuados_cobraveis(df_base, coluna_nome_autuado):
-    """
-    Remove da base os autuados classificados como:
-    - Não pode cobrar - Órgão
-    - Não pode cobrar - Banco
-    - Não pode cobrar - Leasing
-
-    Exceções configuradas (como SAFRA) permanecem na base.
-    """
-    if df_base is None or df_base.empty or not coluna_nome_autuado or coluna_nome_autuado not in df_base.columns:
-        return df_base
-
-    detalhes = df_base[coluna_nome_autuado].apply(classificar_autuado_detalhado)
-    detalhes_df = pd.DataFrame(
-        detalhes.tolist(),
-        index=df_base.index,
-        columns=['_CLASSIFICACAO_AUTUADO', '_MOTIVO_CLASSIFICACAO', '_TERMO_IDENTIFICADO']
-    )
-    df_filtrado = df_base.copy()
-    df_filtrado['_CLASSIFICACAO_AUTUADO'] = detalhes_df['_CLASSIFICACAO_AUTUADO']
-    df_filtrado['_MOTIVO_CLASSIFICACAO'] = detalhes_df['_MOTIVO_CLASSIFICACAO']
-    df_filtrado['_TERMO_IDENTIFICADO'] = detalhes_df['_TERMO_IDENTIFICADO']
-    return df_filtrado[df_filtrado['_CLASSIFICACAO_AUTUADO'] == 'Pode cobrar'].copy()
-
-
-# Função para normalizar e mesclar modais
-def normalizar_e_mesclar_modais(modal_serasa, modal_divida):
-    """
-    Normaliza e mescla modais de ambas as bases, padronizando para maiúsculas.
-    Se ambos existirem e forem diferentes, mescla com separador.
-    """
-    modal_serasa_str = str(modal_serasa).strip().upper() if pd.notna(modal_serasa) and str(modal_serasa).strip() != '' else None
-    modal_divida_str = str(modal_divida).strip().upper() if pd.notna(modal_divida) and str(modal_divida).strip() != '' else None
-    
-    # Se ambos existirem
-    if modal_serasa_str and modal_divida_str:
-        # Se forem iguais, retorna apenas um
-        if modal_serasa_str == modal_divida_str:
-            return modal_serasa_str
-        # Se forem diferentes, mescla com separador
-        else:
-            return f"{modal_serasa_str} / {modal_divida_str}"
-    # Se apenas SERASA existir
-    elif modal_serasa_str:
-        return modal_serasa_str
-    # Se apenas Dívida existir
-    elif modal_divida_str:
-        return modal_divida_str
-    # Se nenhum existir
-    else:
-        return ''
-
-# Função para formatar CPF/CNPJ no formato brasileiro
-def formatar_cpf_cnpj_brasileiro(valor):
-    """
-    Formata CPF/CNPJ no formato brasileiro:
-    - CPF: XXX.XXX.XXX-XX (11 dígitos)
-    - CNPJ: XX.XXX.XXX/XXXX-XX (14 dígitos)
-    """
-    if pd.isna(valor) or valor == '' or valor is None:
-        return ''
-    
-    # Remove caracteres não numéricos
-    valor_str = str(valor).replace('.', '').replace('-', '').replace('/', '').strip()
-    
-    # Se estiver vazio, retorna vazio
-    if not valor_str or not valor_str.isdigit():
-        return str(valor)  # Retorna o valor original se não for numérico
-    
-    # Formatar CPF (11 dígitos)
-    if len(valor_str) == 11:
-        return f"{valor_str[0:3]}.{valor_str[3:6]}.{valor_str[6:9]}-{valor_str[9:11]}"
-    
-    # Formatar CNPJ (14 dígitos)
-    elif len(valor_str) == 14:
-        return f"{valor_str[0:2]}.{valor_str[2:5]}.{valor_str[5:8]}/{valor_str[8:12]}-{valor_str[12:14]}"
-    
-    # Se não tiver 11 ou 14 dígitos, retorna o valor original
-    return str(valor)
-
-
-def formatar_valor_br(valor):
-    """Formata valor numérico no padrão brasileiro: R$ 1.234,56 ou R$ 0,00 para zero/nulo."""
-    if valor is None or pd.isna(valor):
-        return "R$ 0,00"
-    try:
-        v = float(valor)
-        if v == 0:
-            return "R$ 0,00"
-        s = f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-        return "R$ " + s
-    except (TypeError, ValueError):
-        return "R$ 0,00"
-
-# Regras de decadência:
-# - Início do prazo: primeiro dia útil >= Data Infração (a própria data se for dia útil).
-# - Autuação: 31 dias CORRIDOS a partir desse dia 1; data de notificação ajustada +4 dias.
-# - Multa: 180 dias CORRIDOS a partir desse dia 1; data de notificação ajustada +4 dias.
-PRAZO_DIAS_AUTUACAO = 31   # dias corridos
-PRAZO_DIAS_MULTA = 181     # dias corridos
-
-AJUSTE_DIAS_AUTUACAO = 4   # ajuste sobre a data de autuação (planilha → expedição)
-AJUSTE_DIAS_MULTA = 4      # ajuste sobre a data de notificação de multa
-
-
-def _easter_year(ano):
-    """Retorna a data do domingo de Páscoa no ano dado (algoritmo de Butcher/Meeus)."""
-    a = ano % 19
-    b = ano // 100
-    c = ano % 100
-    d = b // 4
-    e = b % 4
-    f = (b + 8) // 25
-    g = (b - f + 1) // 3
-    h = (19 * a + b - d - g + 15) % 30
-    i = c // 4
-    k = c % 4
-    l = (32 + 2 * e + 2 * i - h - k) % 7
-    m = (a + 11 * h + 22 * l) // 451
-    mes = (h + l - 7 * m + 114) // 31
-    dia = ((h + l - 7 * m + 114) % 31) + 1
-    return date(ano, mes, dia)
-
-
-def _feriados_nacionais_brasil(ano):
-    """
-    Retorna um set de datas (date) dos feriados nacionais do Brasil no ano.
-    Usado para definir o primeiro dia útil a partir da data da infração (início do prazo de decadência).
-    Referência: Lei 662/1949 e legislação federal vigente.
-    """
-    pascoa = _easter_year(ano)
-    feriados = {
-        date(ano, 1, 1),     # Confraternização Universal (Ano Novo)
-        date(ano, 4, 21),   # Tiradentes
-        date(ano, 5, 1),    # Dia do Trabalho
-        date(ano, 9, 7),    # Independência do Brasil
-        date(ano, 10, 12),  # Nossa Senhora Aparecida
-        date(ano, 11, 2),   # Finados
-        date(ano, 11, 15),  # Proclamação da República
-        date(ano, 12, 25),  # Natal
-    }
-    # Feriados móveis (calculados a partir da Páscoa)
-    feriados.add(pascoa - timedelta(days=2))   # Sexta-feira Santa (Paixão de Cristo)
-    feriados.add(pascoa - timedelta(days=48))  # Segunda-feira de Carnaval
-    feriados.add(pascoa - timedelta(days=47))  # Terça-feira de Carnaval
-    feriados.add(pascoa + timedelta(days=60))  # Corpus Christi
-    return feriados
-
-
-def _resolver_coluna_data(df, nome_base):
-    """Retorna o nome da coluna de data no DataFrame (com ou sem sufixo _serasa/_divida)."""
-    if nome_base in df.columns:
-        return nome_base
-    if f"{nome_base}_serasa" in df.columns:
-        return f"{nome_base}_serasa"
-    if f"{nome_base}_divida" in df.columns:
-        return f"{nome_base}_divida"
-    return None
-
-# Modais para os quais a decadência deve ser calculada
-_MODAIS_COM_DECADENCIA = ['EXCESSO DE PESO', 'EVASAO DE PEDAGIO']
-
-def _modal_tem_decadencia(modal_str):
-    """Retorna True se o modal se enquadra nos tipos com cálculo de decadência
-    (Excesso de Peso ou Evasão de Pedágio). Comparação sem sensibilidade a acentos."""
-    if not modal_str or (isinstance(modal_str, float)):
-        return False
-    import unicodedata
-    m = unicodedata.normalize('NFD', str(modal_str).upper().strip())
-    m_sem_acento = ''.join(c for c in m if unicodedata.category(c) != 'Mn')
-    return any(kw in m_sem_acento for kw in _MODAIS_COM_DECADENCIA)
-
-
-def calcular_situacao_decadente(df, coluna_modal=None):
-    """
-    Calcula a coluna [Situação decadente] com base nas datas da SERASA:
-    - Data Infração: referência. Início do prazo = primeiro dia útil >= Data Infração
-      (a própria data se for dia útil; caso contrário, o próximo dia útil).
-    - A partir desse dia 1, a contagem é em DIAS CORRIDOS (não dias úteis).
-    - Para compensar o atraso entre emissão e expedição:
-        * Autuação: soma-se AJUSTE_DIAS_AUTUACAO (4 dias) à Data Primeira Notificação Autuação.
-        * Multa: soma-se AJUSTE_DIAS_MULTA (4 dias) à Data Primeira Notificação Multa.
-    - Data Primeira Notificação Autuação (ajustada): não pode ultrapassar 31 dias corridos
-      a partir do primeiro dia útil.
-    - Data Primeira Notificação Multa (ajustada): não pode ultrapassar 181 dias corridos
-      a partir do primeiro dia útil.
-    Retorna Series: '' | 'Decadente autuação' | 'Decadente multa' | 'Decadente autuação e multa'.
-    """
-    col_infracao = _resolver_coluna_data(df, "Data Infração")
-    col_notif_autuacao = _resolver_coluna_data(df, "Data Primeira Notificação Autuação")
-    col_notif_multa = _resolver_coluna_data(df, "Data Primeira Notificação Multa")
-    if not col_infracao or (not col_notif_autuacao and not col_notif_multa):
-        return pd.Series([''] * len(df), index=df.index)
-    data_infracao = pd.to_datetime(df[col_infracao], errors='coerce', dayfirst=True)
-    data_notif_autuacao = pd.to_datetime(df[col_notif_autuacao], errors='coerce', dayfirst=True) if col_notif_autuacao else pd.Series([pd.NaT] * len(df), index=df.index)
-    data_notif_multa = pd.to_datetime(df[col_notif_multa], errors='coerce', dayfirst=True) if col_notif_multa else pd.Series([pd.NaT] * len(df), index=df.index)
-
-    # Construir conjunto de feriados para achar o primeiro dia útil a partir da infração
-    series_todas_datas = pd.concat([
-        data_infracao.dropna(),
-        data_notif_autuacao.dropna(),
-        data_notif_multa.dropna(),
-    ]) if (data_notif_autuacao is not None and data_notif_multa is not None) else data_infracao.dropna()
-
-    anos = set()
-    for v in series_todas_datas:
-        try:
-            t = pd.Timestamp(v)
-            if pd.notna(t):
-                anos.add(t.year)
-        except Exception:
-            pass
-    feriados = set()
-    for a in anos:
-        feriados |= _feriados_nacionais_brasil(a)
-        feriados |= _feriados_nacionais_brasil(a + 1)
-
-    def primeiro_dia_util_a_partir(dt):
-        """Primeiro dia útil >= dt (considerando sábado/domingo/feriado)."""
-        if pd.isna(dt):
-            return pd.NaT
-        d = dt.date()
-        while True:
-            if d.weekday() < 5 and d not in feriados:
-                return pd.Timestamp(d)
-            d += timedelta(days=1)
-
-    # Início do prazo = primeiro dia útil a partir da Data Infração
-    inicio_prazo = data_infracao.apply(primeiro_dia_util_a_partir)
-
-    # Ajustar datas de notificação (compensar atraso entre emissão e expedição)
-    data_notif_autuacao_ajustada = data_notif_autuacao + pd.to_timedelta(AJUSTE_DIAS_AUTUACAO, unit="D")
-    data_notif_multa_ajustada = data_notif_multa + pd.to_timedelta(AJUSTE_DIAS_MULTA, unit="D")
-
-    # Contagem em DIAS CORRIDOS a partir do primeiro dia útil
-    dias_corridos_autuacao = (data_notif_autuacao_ajustada - inicio_prazo).dt.days
-    dias_corridos_multa = (data_notif_multa_ajustada - inicio_prazo).dt.days
-
-    decadente_autuacao = dias_corridos_autuacao > PRAZO_DIAS_AUTUACAO
-    decadente_multa = dias_corridos_multa > PRAZO_DIAS_MULTA
-
-    # A decadência de multa só é considerada para infrações a partir de 11/04/2021.
-    # Antes dessa data, apenas a decadência de autuação pode ser marcada.
-    data_corte_multa = pd.Timestamp('2021-04-11')
-    mask_permite_multa = data_infracao >= data_corte_multa
-    decadente_multa = decadente_multa & mask_permite_multa.fillna(False)
-    situacao = pd.Series([''] * len(df), index=df.index, dtype=object)
-    both_ = decadente_autuacao & decadente_multa
-    only_aut = decadente_autuacao & ~decadente_multa
-    only_multa = ~decadente_autuacao & decadente_multa
-    situacao = situacao.mask(both_, 'Decadente autuação e multa').mask(only_aut, 'Decadente autuação').mask(only_multa, 'Decadente multa')
-
-    # Aplicar filtro por modal: somente Excesso de Peso e Evasão de Pedágio têm decadência calculada
-    col_modal_efetivo = coluna_modal if (coluna_modal and coluna_modal in df.columns) else ('Modais' if 'Modais' in df.columns else None)
-    if col_modal_efetivo:
-        mask_modal = df[col_modal_efetivo].apply(_modal_tem_decadencia)
-        situacao = situacao.where(mask_modal, '')
-
-    return situacao
+# --- Funções de negócio foram extraídas para módulos: utils.py, classificacao.py, decadencia.py ---
 
 # Função principal de análise - SEGUINDO A ORDEM DO SQL
-def analisar_bases(df_serasa, df_divida, col_auto, col_cpf, col_valor, col_vencimento, coluna_protocolo, coluna_modal_serasa=None, coluna_modal_divida=None):
+def analisar_bases(df_serasa, df_divida, col_auto, col_cpf, col_valor, col_vencimento, coluna_protocolo, coluna_modal_serasa=None, coluna_modal_divida=None, ano_analise=2025):
     resultados = {}
     
     # Verificar se a coluna de Auto de Infração existe (OBRIGATÓRIA)
@@ -942,15 +389,14 @@ def analisar_bases(df_serasa, df_divida, col_auto, col_cpf, col_valor, col_venci
             df_sem_duplicados = df_sem_zero.drop_duplicates(subset=['AUTO_NORM'], keep='first').copy()
     
     # ==========================================
-    # PASSO 5: FILTRAR POR DATA (vencimento em 2025: 01/01/2025 a 31/12/2025)
+    # PASSO 5: FILTRAR POR DATA (vencimento no ano selecionado)
     # ==========================================
-    # Filtrar por data usando comparação de data (mais confiável que texto)
     col_vencimento_usar = f"{col_vencimento}_serasa" if f"{col_vencimento}_serasa" in df_sem_duplicados.columns else col_vencimento
     if col_vencimento_usar not in df_sem_duplicados.columns:
         col_vencimento_usar = f"{col_vencimento}_divida" if f"{col_vencimento}_divida" in df_sem_duplicados.columns else col_vencimento
     
-    data_limite = pd.Timestamp('2025-01-01')
-    data_limite_fim = pd.Timestamp('2025-12-31')
+    data_limite = pd.Timestamp(f'{ano_analise}-01-01')
+    data_limite_fim = pd.Timestamp(f'{ano_analise}-12-31')
     
     if col_vencimento_usar in df_sem_duplicados.columns:
         try:
@@ -969,37 +415,31 @@ def analisar_bases(df_serasa, df_divida, col_auto, col_cpf, col_valor, col_venci
             else:
                 df_temp['_VENCIMENTO_DT'] = df_temp[col_vencimento_usar]
             
-            # Filtrar apenas datas em 2025 (01/01/2025 a 31/12/2025, excluindo NaT)
             df_final = df_temp[
                 (df_temp['_VENCIMENTO_DT'].notna()) & 
                 (df_temp['_VENCIMENTO_DT'] >= data_limite) &
                 (df_temp['_VENCIMENTO_DT'] <= data_limite_fim)
         ].copy()
             
-            # Remover coluna auxiliar
             if '_VENCIMENTO_DT' in df_final.columns:
                 df_final = df_final.drop(columns=['_VENCIMENTO_DT'])
         except Exception as e:
-            # Se falhar, tentar método alternativo com comparação de texto (apenas ano 2025)
             try:
                 df_temp = df_sem_duplicados.copy()
-                # Converter para string para fazer comparação LIKE (fallback)
                 df_temp[col_vencimento_usar] = df_temp[col_vencimento_usar].astype(str)
-                # Filtrar apenas datas que contenham 2025 (excluindo 2026)
+                ano_str = str(ano_analise)
                 df_final = df_temp[
-                    (df_temp[col_vencimento_usar].str.contains('/2025', na=False)) |
-                    (df_temp[col_vencimento_usar].str.contains('-2025', na=False)) |
-                    (df_temp[col_vencimento_usar].str.contains('2025', na=False))
+                    (df_temp[col_vencimento_usar].str.contains(f'/{ano_str}', na=False)) |
+                    (df_temp[col_vencimento_usar].str.contains(f'-{ano_str}', na=False)) |
+                    (df_temp[col_vencimento_usar].str.contains(ano_str, na=False))
                 ].copy()
                 # Remover valores inválidos (NaT, nan, etc)
                 df_final = df_final[
                     (~df_final[col_vencimento_usar].isin(['NaT', 'nan', 'None', '']))
                 ].copy()
-            except:
-                # Se tudo falhar, usar todos os dados
+            except (ValueError, TypeError, KeyError):
                 df_final = df_sem_duplicados.copy()
     else:
-        # Se não encontrar coluna de vencimento, usar todos os dados
         df_final = df_sem_duplicados.copy()
     
     # Preparar dados para retorno (usar estrutura similar à anterior para compatibilidade)
@@ -1041,40 +481,25 @@ def analisar_bases(df_serasa, df_divida, col_auto, col_cpf, col_valor, col_venci
     else:
         df_divida_filtrado['CPF_CNPJ_NORM'] = None
     
-    # Extrair e mesclar modais de ambas as bases
+    def _construir_mapa_modal(df_base, col_auto_norm, col_modal):
+        """Constrói mapa AUTO_NORM -> modal usando operações vetorizadas."""
+        if df_base is None or df_base.empty or col_modal not in df_base.columns or col_auto_norm not in df_base.columns:
+            return {}
+        df_valido = df_base[[col_auto_norm, col_modal]].dropna(subset=[col_auto_norm])
+        df_com_modal = df_valido[df_valido[col_modal].notna()]
+        if not df_com_modal.empty:
+            return df_com_modal.drop_duplicates(subset=[col_auto_norm], keep='first').set_index(col_auto_norm)[col_modal].to_dict()
+        return df_valido.drop_duplicates(subset=[col_auto_norm], keep='first').set_index(col_auto_norm)[col_modal].to_dict()
+
     if coluna_modal_serasa and coluna_modal_divida:
-        # Criar mapeamento de modais por AUTO_NORM (usar bases originais para ter todos os dados)
-        modal_serasa_map = {}
-        if coluna_modal_serasa in df_serasa_clean.columns:
-            for idx, row in df_serasa_clean.iterrows():
-                auto_norm = row.get('AUTO_NORM')
-                if auto_norm:
-                    modal_val = row.get(coluna_modal_serasa)
-                    if auto_norm not in modal_serasa_map or pd.notna(modal_val):
-                        modal_serasa_map[auto_norm] = modal_val
-        elif coluna_modal_serasa in df_serasa_filtrado.columns:
-            for idx, row in df_serasa_filtrado.iterrows():
-                auto_norm = row.get('AUTO_NORM')
-                if auto_norm:
-                    modal_val = row.get(coluna_modal_serasa)
-                    if auto_norm not in modal_serasa_map or pd.notna(modal_val):
-                        modal_serasa_map[auto_norm] = modal_val
-        
-        modal_divida_map = {}
-        if coluna_modal_divida in df_divida_clean.columns:
-            for idx, row in df_divida_clean.iterrows():
-                auto_norm = row.get('AUTO_NORM')
-                if auto_norm:
-                    modal_val = row.get(coluna_modal_divida)
-                    if auto_norm not in modal_divida_map or pd.notna(modal_val):
-                        modal_divida_map[auto_norm] = modal_val
-        elif coluna_modal_divida in df_divida_filtrado.columns:
-            for idx, row in df_divida_filtrado.iterrows():
-                auto_norm = row.get('AUTO_NORM')
-                if auto_norm:
-                    modal_val = row.get(coluna_modal_divida)
-                    if auto_norm not in modal_divida_map or pd.notna(modal_val):
-                        modal_divida_map[auto_norm] = modal_val
+        modal_serasa_map = _construir_mapa_modal(
+            df_serasa_clean if coluna_modal_serasa in df_serasa_clean.columns else df_serasa_filtrado,
+            'AUTO_NORM', coluna_modal_serasa
+        )
+        modal_divida_map = _construir_mapa_modal(
+            df_divida_clean if coluna_modal_divida in df_divida_clean.columns else df_divida_filtrado,
+            'AUTO_NORM', coluna_modal_divida
+        )
         
         # Mesclar modais e adicionar coluna 'Modais' nos dataframes filtrados
         if 'AUTO_NORM' in df_serasa_filtrado.columns:
@@ -1111,100 +536,46 @@ def analisar_bases(df_serasa, df_divida, col_auto, col_cpf, col_valor, col_venci
     cpf_apenas_serasa = cpf_serasa - cpf_divida
     cpf_apenas_divida = cpf_divida - cpf_serasa
     
-    # IMPORTANTE: Calcular totais gerais (TODOS os autos com vencimento em 2025: 01/01/2025 a 31/12/2025)
-    # Totais gerais da SERASA: pegar coluna "Data do Vencimento" e filtrar apenas ano 2025
-    data_limite = pd.Timestamp('2025-01-01')
-    data_limite_fim = pd.Timestamp('2025-12-31')
-    if col_vencimento in df_serasa_clean.columns:
+    # Calcular totais gerais (TODOS os autos com vencimento no ano selecionado)
+    data_limite = pd.Timestamp(f'{ano_analise}-01-01')
+    data_limite_fim = pd.Timestamp(f'{ano_analise}-12-31')
+    ano_str = str(ano_analise)
+
+    def _filtrar_por_ano(df_base, col_venc):
+        """Filtra DataFrame por ano de vencimento com fallback de texto."""
+        if col_venc not in df_base.columns:
+            return df_base.copy()
         try:
-            # Criar cópia para não modificar o original
-            df_serasa_temp = df_serasa_clean.copy()
-            
-            # Converter para datetime se ainda não estiver
-            if df_serasa_temp[col_vencimento].dtype != 'datetime64[ns]':
-                df_serasa_temp['_VENCIMENTO_DT'] = pd.to_datetime(
-                    df_serasa_temp[col_vencimento], 
-                    errors='coerce',
-                    dayfirst=True,  # Suporta formato DD/MM/YYYY
-                    infer_datetime_format=True
-                )
+            df_tmp = df_base.copy()
+            if df_tmp[col_venc].dtype != 'datetime64[ns]':
+                df_tmp['_VENCIMENTO_DT'] = pd.to_datetime(df_tmp[col_venc], errors='coerce', dayfirst=True)
             else:
-                df_serasa_temp['_VENCIMENTO_DT'] = df_serasa_temp[col_vencimento]
-            
-            # Filtrar apenas datas em 2025 (01/01/2025 a 31/12/2025, excluindo NaT)
-            df_serasa_total_2025 = df_serasa_temp[
-                (df_serasa_temp['_VENCIMENTO_DT'].notna()) & 
-                (df_serasa_temp['_VENCIMENTO_DT'] >= data_limite) &
-                (df_serasa_temp['_VENCIMENTO_DT'] <= data_limite_fim)
+                df_tmp['_VENCIMENTO_DT'] = df_tmp[col_venc]
+            resultado = df_tmp[
+                (df_tmp['_VENCIMENTO_DT'].notna()) &
+                (df_tmp['_VENCIMENTO_DT'] >= data_limite) &
+                (df_tmp['_VENCIMENTO_DT'] <= data_limite_fim)
             ].copy()
-            
-            # Remover coluna auxiliar
-            if '_VENCIMENTO_DT' in df_serasa_total_2025.columns:
-                df_serasa_total_2025 = df_serasa_total_2025.drop(columns=['_VENCIMENTO_DT'])
-        except Exception as e:
-            # Se falhar, tentar método alternativo (apenas ano 2025)
+            if '_VENCIMENTO_DT' in resultado.columns:
+                resultado = resultado.drop(columns=['_VENCIMENTO_DT'])
+            return resultado
+        except Exception:
             try:
-                df_serasa_temp = df_serasa_clean.copy()
-                df_serasa_temp[col_vencimento] = df_serasa_temp[col_vencimento].astype(str)
-                df_serasa_total_2025 = df_serasa_temp[
-                    (df_serasa_temp[col_vencimento].str.contains('/2025', na=False)) |
-                    (df_serasa_temp[col_vencimento].str.contains('-2025', na=False))
+                df_tmp = df_base.copy()
+                df_tmp[col_venc] = df_tmp[col_venc].astype(str)
+                resultado = df_tmp[
+                    (df_tmp[col_venc].str.contains(f'/{ano_str}', na=False)) |
+                    (df_tmp[col_venc].str.contains(f'-{ano_str}', na=False))
                 ].copy()
-                df_serasa_total_2025 = df_serasa_total_2025[
-                    (~df_serasa_total_2025[col_vencimento].isin(['NaT', 'nan', 'None', '']))
-                ].copy()
+                resultado = resultado[~resultado[col_venc].isin(['NaT', 'nan', 'None', ''])].copy()
+                return resultado
             except Exception:
-                # Se ainda assim falhar, usar a base limpa sem filtro de data
-                df_serasa_total_2025 = df_serasa_clean.copy()
-    else:
-        df_serasa_total_2025 = df_serasa_clean.copy()
+                return df_base.copy()
+
+    df_serasa_total_ano = _filtrar_por_ano(df_serasa_clean, col_vencimento)
+    df_divida_total_ano = _filtrar_por_ano(df_divida_clean, col_vencimento)
     
-    # Totais gerais da Dívida Ativa: pegar coluna "Data do Vencimento" e filtrar apenas ano 2025
-    if col_vencimento in df_divida_clean.columns:
-        try:
-            # Criar cópia para não modificar o original
-            df_divida_temp = df_divida_clean.copy()
-            
-            # Converter para datetime se ainda não estiver
-            if df_divida_temp[col_vencimento].dtype != 'datetime64[ns]':
-                df_divida_temp['_VENCIMENTO_DT'] = pd.to_datetime(
-                    df_divida_temp[col_vencimento], 
-                    errors='coerce',
-                    dayfirst=True,  # Suporta formato DD/MM/YYYY
-                    infer_datetime_format=True
-                )
-            else:
-                df_divida_temp['_VENCIMENTO_DT'] = df_divida_temp[col_vencimento]
-            
-            # Filtrar apenas datas em 2025 (01/01/2025 a 31/12/2025, excluindo NaT)
-            df_divida_total_2025 = df_divida_temp[
-                (df_divida_temp['_VENCIMENTO_DT'].notna()) & 
-                (df_divida_temp['_VENCIMENTO_DT'] >= data_limite) &
-                (df_divida_temp['_VENCIMENTO_DT'] <= data_limite_fim)
-            ].copy()
-            
-            # Remover coluna auxiliar
-            if '_VENCIMENTO_DT' in df_divida_total_2025.columns:
-                df_divida_total_2025 = df_divida_total_2025.drop(columns=['_VENCIMENTO_DT'])
-        except Exception as e:
-            # Se falhar, tentar método alternativo (apenas ano 2025)
-            try:
-                df_divida_temp = df_divida_clean.copy()
-                df_divida_temp[col_vencimento] = df_divida_temp[col_vencimento].astype(str)
-                df_divida_total_2025 = df_divida_temp[
-                    (df_divida_temp[col_vencimento].str.contains('/2025', na=False)) |
-                    (df_divida_temp[col_vencimento].str.contains('-2025', na=False))
-                ].copy()
-                df_divida_total_2025 = df_divida_total_2025[
-                    (~df_divida_total_2025[col_vencimento].isin(['NaT', 'nan', 'None', '']))
-                ].copy()
-            except Exception:
-                # Se ainda assim falhar, usar a base limpa sem filtro de data
-                df_divida_total_2025 = df_divida_clean.copy()
-    else:
-        df_divida_total_2025 = df_divida_clean.copy()
-    
-    # IMPORTANTE: df_serasa_filtrado e df_divida_filtrado JÁ estão filtrados por vencimento em 2025
+    # df_serasa_filtrado e df_divida_filtrado JÁ estão filtrados por vencimento no ano selecionado
     # Não precisamos filtrar novamente, apenas garantir que as datas estão no formato correto
     df_serasa_2025 = df_serasa_filtrado.copy()
     df_divida_2025 = df_divida_filtrado.copy()
@@ -1427,33 +798,12 @@ def analisar_bases(df_serasa, df_divida, col_auto, col_cpf, col_valor, col_venci
     autos_em_ambas_geral = set(df_final_geral['AUTO_NORM'].unique())
     autos_em_ambas_geral_linhas = len(df_final_geral)
     
-    # Adicionar modais e CPF_CNPJ_NORM ao df_final_geral (se modais foram processados)
     if coluna_modal_serasa and coluna_modal_divida:
-        # Criar mapeamentos de modais para df_final_geral
-        modal_serasa_map_geral = {}
-        if coluna_modal_serasa in df_serasa_clean.columns:
-            for idx, row in df_serasa_clean.iterrows():
-                auto_norm = row.get('AUTO_NORM')
-                if auto_norm:
-                    modal_val = row.get(coluna_modal_serasa)
-                    if auto_norm not in modal_serasa_map_geral or pd.notna(modal_val):
-                        modal_serasa_map_geral[auto_norm] = modal_val
-        
-        modal_divida_map_geral = {}
-        if coluna_modal_divida in df_divida_clean.columns:
-            for idx, row in df_divida_clean.iterrows():
-                auto_norm = row.get('AUTO_NORM')
-                if auto_norm:
-                    modal_val = row.get(coluna_modal_divida)
-                    if auto_norm not in modal_divida_map_geral or pd.notna(modal_val):
-                        modal_divida_map_geral[auto_norm] = modal_val
-        
-        # Adicionar coluna 'Modais' no df_final_geral
         if 'AUTO_NORM' in df_final_geral.columns:
             df_final_geral['Modais'] = df_final_geral['AUTO_NORM'].apply(
                 lambda auto: normalizar_e_mesclar_modais(
-                    modal_serasa_map_geral.get(auto),
-                    modal_divida_map_geral.get(auto)
+                    modal_serasa_map.get(auto),
+                    modal_divida_map.get(auto)
                 )
             )
     
@@ -1477,8 +827,8 @@ def analisar_bases(df_serasa, df_divida, col_auto, col_cpf, col_valor, col_venci
         'df_divida_filtrado': df_divida_2025,  # Autos em ambas as bases com vencimento em 2025
         'df_final_sql': df_final,  # DataFrame final seguindo a ordem do SQL (para exportação)
         'df_final_geral': df_final_geral,  # DataFrame geral SEM filtro de vencimento (para comparação geral)
-        'df_serasa_total_2025': df_serasa_total_2025,  # TODOS os autos SERASA com vencimento em 2025
-        'df_divida_total_2025': df_divida_total_2025,  # TODOS os autos Dívida Ativa com vencimento em 2025
+        'df_serasa_total_ano': df_serasa_total_ano,
+        'df_divida_total_ano': df_divida_total_ano,
         # Estatísticas por AUTO DE INFRAÇÃO (PRINCIPAL - COM filtro de vencimento em 2025)
         'autos_em_ambas': autos_em_ambas_linhas,  # Número de LINHAS válidas (vencimento em 2025 e valor > 0)
         'autos_em_ambas_unicos': len(autos_em_ambas),  # Número de AUTOS ÚNICOS em ambas as bases (com filtro em 2025)
@@ -1549,9 +899,31 @@ if arquivo_serasa and arquivo_divida:
         
         st.markdown("---")
         
-        # Botão de análise
+        def _hash_analise(df_s, df_d, params):
+            """Hash dos dados e parâmetros para invalidação inteligente de cache."""
+            h = hashlib.md5()
+            h.update(str(len(df_s)).encode())
+            h.update(str(len(df_d)).encode())
+            h.update(str(list(df_s.columns)).encode())
+            h.update(str(list(df_d.columns)).encode())
+            for p in params:
+                h.update(str(p).encode())
+            return h.hexdigest()
+        
+        params_analise = [coluna_auto, coluna_cpf_cnpj, coluna_valor, coluna_vencimento,
+                          coluna_protocolo, coluna_modal_serasa, coluna_modal_divida, ano_analise]
+        hash_atual = _hash_analise(df_serasa, df_divida, params_analise)
+        
+        cache_valido = (
+            'resultados' in st.session_state and
+            st.session_state.get('_analise_hash') == hash_atual
+        )
+        if cache_valido:
+            st.info("💡 Resultados anteriores carregados do cache. Clique em \"Executar Análise Completa\" para re-analisar.")
+
+        resultados = None
         if st.button("🚀 Executar Análise Completa", type="primary", use_container_width=True):
-            if not coluna_auto:
+            if not coluna_auto or not coluna_auto.strip():
                 st.error("⚠️ Por favor, informe o nome da coluna de Auto de Infração!")
             else:
                 with st.spinner("Analisando bases de dados por Auto de Infração... Isso pode levar alguns instantes."):
@@ -1564,25 +936,28 @@ if arquivo_serasa and arquivo_divida:
                         coluna_vencimento,
                         coluna_protocolo,
                         coluna_modal_serasa,
-                        coluna_modal_divida
+                        coluna_modal_divida,
+                        ano_analise=ano_analise
                     )
             
             if resultados:
                 st.session_state['resultados'] = resultados
-                # Armazenar configurações de colunas
+                st.session_state['_analise_hash'] = hash_atual
                 st.session_state['coluna_auto'] = coluna_auto
                 st.session_state['coluna_cpf_cnpj'] = coluna_cpf_cnpj
-                # Valor principal (SERASA)
                 st.session_state['coluna_valor'] = coluna_valor
-                # Valor da base Dívida Ativa
                 st.session_state['coluna_valor_divida'] = coluna_valor_divida
                 st.session_state['coluna_vencimento'] = coluna_vencimento
                 st.session_state['coluna_protocolo'] = coluna_protocolo
                 st.session_state['coluna_modal_serasa'] = coluna_modal_serasa
                 st.session_state['coluna_modal_divida'] = coluna_modal_divida
                 st.session_state['coluna_nome_autuado'] = coluna_nome_autuado
+                st.session_state['ano_analise'] = ano_analise
                 st.session_state['export_run_id'] = datetime.now().strftime('%Y%m%d%H%M%S%f')
                 st.session_state['export_run_label'] = datetime.now().strftime('%d %m %Y %H:%M')
+                st.session_state['nome_arquivo_serasa'] = arquivo_serasa.name
+                st.session_state['nome_arquivo_divida'] = arquivo_divida.name
+                st.session_state['_historico_salvo'] = False
                 st.success("✅ Análise concluída com sucesso!")
                 st.rerun()
 
@@ -1601,6 +976,7 @@ if 'resultados' in st.session_state:
     coluna_modal_serasa = st.session_state.get('coluna_modal_serasa', 'Tipo Modal')
     coluna_modal_divida = st.session_state.get('coluna_modal_divida', 'Subtipo de Débito')
     coluna_nome_autuado = st.session_state.get('coluna_nome_autuado', 'Nome Autuado')
+    ano_analise = st.session_state.get('ano_analise', 2025)
     
     st.markdown("---")
     st.markdown("## 📊 Dashboard de Resultados - Análise por Auto de Infração")
@@ -1615,7 +991,7 @@ if 'resultados' in st.session_state:
             f"{resultados['total_registros_serasa']:,}",
             delta=f"{resultados['total_autos_serasa']:,} autos únicos válidos"
         )
-        st.caption(f"📋 {len(resultados['df_serasa_filtrado']):,} registros após filtros (vencimento em 2025: 01/01 a 31/12)")
+        st.caption(f"📋 {len(resultados['df_serasa_filtrado']):,} registros após filtros (vencimento em {ano_analise}: 01/01 a 31/12)")
     
     with col2:
         st.metric(
@@ -1623,7 +999,7 @@ if 'resultados' in st.session_state:
             f"{resultados['total_registros_divida']:,}",
             delta=f"{resultados['total_autos_divida']:,} autos únicos válidos"
         )
-        st.caption(f"📋 {len(resultados['df_divida_filtrado']):,} registros após filtros (vencimento em 2025: 01/01 a 31/12)")
+        st.caption(f"📋 {len(resultados['df_divida_filtrado']):,} registros após filtros (vencimento em {ano_analise}: 01/01 a 31/12)")
     
     with col3:
         # Mostrar número de linhas (registros) que estão em ambas as bases
@@ -1643,7 +1019,7 @@ if 'resultados' in st.session_state:
         )
     
     # Métricas adicionais - Autos por faixa de valor
-    st.markdown("#### 💰 Autos por Faixa de Valor (SERASA - Vencimento em 2025)")
+    st.markdown(f"#### 💰 Autos por Faixa de Valor (SERASA - Vencimento em {ano_analise})")
     col5, col6 = st.columns(2)
     
     with col5:
@@ -1703,7 +1079,7 @@ if 'resultados' in st.session_state:
         st.metric(
             "Diferença (Geral vs Filtrado)",
             f"{diferenca_autos:,} autos",
-            delta="Geral - Filtrado (vencimento em 2025)"
+            delta=f"Geral - Filtrado (vencimento em {ano_analise})"
         )
         st.caption("📊 Diferença entre geral e filtrado")
     
@@ -1712,23 +1088,23 @@ if 'resultados' in st.session_state:
         if autos_geral > 0:
             taxa_cobertura = (autos_filtrado / autos_geral) * 100
             st.metric(
-                "Cobertura 2025+",
+                f"Cobertura {ano_analise}",
                 f"{taxa_cobertura:.1f}%",
                 delta=f"{autos_filtrado:,} de {autos_geral:,}"
             )
-            st.caption("📈 % dos autos com vencimento em 2025")
+            st.caption(f"📈 % dos autos com vencimento em {ano_analise}")
         else:
-            st.metric("Cobertura 2025+", "N/A")
+            st.metric(f"Cobertura {ano_analise}", "N/A")
     
     # Gráfico comparativo Geral vs Filtrado
     st.markdown("---")
-    st.markdown("##### 📊 Comparação Visual: Geral vs Filtrado (vencimento em 2025)")
+    st.markdown(f"##### 📊 Comparação Visual: Geral vs Filtrado (vencimento em {ano_analise})")
     fig_comparacao = go.Figure(data=[
         go.Bar(name='Todos os Autos (Geral)', x=['Comparação'], y=[autos_geral], marker_color='#3498db', text=f"{autos_geral:,}", textposition='auto'),
-        go.Bar(name='Autos em 2025 (Filtrado)', x=['Comparação'], y=[autos_filtrado], marker_color='#2ecc71', text=f"{autos_filtrado:,}", textposition='auto')
+        go.Bar(name=f'Autos em {ano_analise} (Filtrado)', x=['Comparação'], y=[autos_filtrado], marker_color='#2ecc71', text=f"{autos_filtrado:,}", textposition='auto')
     ])
     fig_comparacao.update_layout(
-        title="Comparação: Todos os Autos vs Autos com Vencimento em 2025",
+        title=f"Comparação: Todos os Autos vs Autos com Vencimento em {ano_analise}",
         xaxis_title="",
         yaxis_title="Quantidade de Autos",
         barmode='group',
@@ -1736,7 +1112,7 @@ if 'resultados' in st.session_state:
         showlegend=True
     )
     st.plotly_chart(fig_comparacao, use_container_width=True)
-    st.caption(f"💡 Comparação entre todos os autos ({autos_geral:,}) e apenas os com vencimento em 2025 ({autos_filtrado:,})")
+    st.caption(f"💡 Comparação entre todos os autos ({autos_geral:,}) e apenas os com vencimento em {ano_analise} ({autos_filtrado:,})")
     
     # VALIDAÇÃO: Seção de verificação de exatidão
     st.markdown("---")
@@ -1756,7 +1132,7 @@ if 'resultados' in st.session_state:
         st.metric(
             "Total Autos em Ambas",
             f"{total_autos_em_ambas:,}",
-            delta="Linhas válidas (vencimento em 2025 e valor > 0)"
+            delta=f"Linhas válidas (vencimento em {ano_analise} e valor > 0)"
         )
     
     with col_val2:
@@ -1896,19 +1272,20 @@ if 'resultados' in st.session_state:
                 st.plotly_chart(fig_decad, use_container_width=True)
     
     # Abas de análise detalhada
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "🔑 Autos de Infração",
         "📈 Agrupamento por CPF/CNPJ",
         "💰 Separação por Valores",
-        "⚠️ Divergências"
+        "⚠️ Divergências",
+        "📜 Histórico"
     ])
     
     with tab1:
         st.markdown("### 🔑 Análise de Autos de Infração")
         st.info("💡 Esta é a análise PRINCIPAL. Os autos de infração são a chave de comparação entre as bases.")
         
-        st.markdown("#### ✅ Autos Presentes em Ambas as Bases (Vencimento em 2025: 01/01 a 31/12)")
-        st.success(f"Total de {resultados['autos_em_ambas']:,} autos de infração encontrados em ambas as bases com vencimento em 2025")
+        st.markdown(f"#### ✅ Autos Presentes em Ambas as Bases (Vencimento em {ano_analise}: 01/01 a 31/12)")
+        st.success(f"Total de {resultados['autos_em_ambas']:,} autos de infração encontrados em ambas as bases com vencimento em {ano_analise}")
         
         # Criar visualização comparativa com valores e vencimentos
         if not resultados['df_serasa_filtrado'].empty and not resultados['df_divida_filtrado'].empty:
@@ -1937,11 +1314,10 @@ if 'resultados' in st.session_state:
             
             with col1:
                 st.markdown("##### 📊 Base SERASA - Autos Correspondentes")
-                st.markdown("**Valores e Vencimentos 2025 em diante**")
+                st.markdown(f"**Valores e Vencimentos {ano_analise} em diante**")
                 st.info("💡 Mostrando apenas autos que estão em **AMBAS as bases** (SERASA e Dívida Ativa)")
                 st.dataframe(df_serasa_display, use_container_width=True, height=400)
                 
-                # Estatísticas de valores - AUTOS EM AMBAS AS BASES
                 if coluna_valor in df_serasa_comp.columns:
                     try:
                         # Garantir que a coluna de valor está convertida para numérico
@@ -1962,11 +1338,11 @@ if 'resultados' in st.session_state:
                         st.error(f"Erro ao calcular valores SERASA: {str(e)}")
                         pass
                 
-                st.caption(f"📋 Total: {len(resultados['df_serasa_filtrado'])} autos de infração em ambas as bases (vencimento em 2025)")
+                st.caption(f"📋 Total: {len(resultados['df_serasa_filtrado'])} autos de infração em ambas as bases (vencimento em {ano_analise})")
             
             with col2:
                 st.markdown("##### 📊 Base Dívida Ativa - Autos Correspondentes")
-                st.markdown("**Valores e Vencimentos 2025 em diante**")
+                st.markdown(f"**Valores e Vencimentos {ano_analise} em diante**")
                 st.info("💡 Mostrando apenas autos que estão em **AMBAS as bases** (SERASA e Dívida Ativa)")
                 st.dataframe(df_divida_display, use_container_width=True, height=400)
                 
@@ -1991,19 +1367,18 @@ if 'resultados' in st.session_state:
                         st.error(f"Erro ao calcular valores Dívida Ativa: {str(e)}")
                         pass
                 
-                st.caption(f"📋 Total: {len(resultados['df_divida_filtrado'])} autos de infração em ambas as bases (vencimento em 2025)")
+                st.caption(f"📋 Total: {len(resultados['df_divida_filtrado'])} autos de infração em ambas as bases (vencimento em {ano_analise})")
             
-            # Comparação de valores - TOTAIS GERAIS (TODOS os autos com vencimento em 2025)
             st.markdown("---")
-            st.markdown("#### 💰 Totais Gerais (TODOS os autos com vencimento em 2025: 01/01 a 31/12)")
-            st.warning("⚠️ **IMPORTANTE:** Estes são os totais de TODOS os autos de cada base com vencimento em 2025, não apenas os que estão em ambas as bases.")
+            st.markdown(f"#### 💰 Totais Gerais (TODOS os autos com vencimento em {ano_analise}: 01/01 a 31/12)")
+            st.warning(f"⚠️ **IMPORTANTE:** Estes são os totais de TODOS os autos de cada base com vencimento em {ano_analise}, não apenas os que estão em ambas as bases.")
             
-            if coluna_valor in resultados['df_serasa_total_2025'].columns and coluna_valor in resultados['df_divida_total_2025'].columns:
+            if coluna_valor in resultados['df_serasa_total_ano'].columns and coluna_valor in resultados['df_divida_total_ano'].columns:
                 col1, col2, col3 = st.columns(3)
                 
                 try:
                     # Calcular totais da SERASA (TODOS os autos)
-                    df_serasa_total = resultados['df_serasa_total_2025'].copy()
+                    df_serasa_total = resultados['df_serasa_total_ano'].copy()
                     if df_serasa_total[coluna_valor].dtype not in ['int64', 'float64']:
                         valores_serasa_total = pd.to_numeric(df_serasa_total[coluna_valor], errors='coerce')
                     else:
@@ -2013,7 +1388,7 @@ if 'resultados' in st.session_state:
                     soma_serasa_total = float(valores_serasa_total_validos.sum()) if len(valores_serasa_total_validos) > 0 else 0.0
                     
                     # Calcular totais da Dívida Ativa (TODOS os autos)
-                    df_divida_total = resultados['df_divida_total_2025'].copy()
+                    df_divida_total = resultados['df_divida_total_ano'].copy()
                     if df_divida_total[coluna_valor].dtype not in ['int64', 'float64']:
                         valores_divida_total = pd.to_numeric(df_divida_total[coluna_valor], errors='coerce')
                     else:
@@ -2025,12 +1400,12 @@ if 'resultados' in st.session_state:
                     with col1:
                         st.metric("💰 Total SERASA (Todos)", f"R$ {soma_serasa_total:,.2f}", 
                                  delta=f"{len(valores_serasa_total_validos):,} autos")
-                        st.caption("Soma de TODOS os valores da coluna de valor da SERASA com vencimento em 2025")
+                        st.caption(f"Soma de TODOS os valores da coluna de valor da SERASA com vencimento em {ano_analise}")
                     
                     with col2:
                         st.metric("💰 Total Dívida Ativa (Todos)", f"R$ {soma_divida_total:,.2f}", 
                                  delta=f"{len(valores_divida_total_validos):,} autos")
-                        st.caption("Soma de TODOS os valores da coluna de valor da Dívida Ativa com vencimento em 2025")
+                        st.caption(f"Soma de TODOS os valores da coluna de valor da Dívida Ativa com vencimento em {ano_analise}")
                     
                     with col3:
                         diferenca_total = soma_serasa_total - soma_divida_total
@@ -2042,7 +1417,7 @@ if 'resultados' in st.session_state:
             # Comparação de valores - APENAS AUTOS EM AMBAS AS BASES
             st.markdown("---")
             st.markdown("#### 💰 Comparação de Valores (Apenas autos em AMBAS as bases)")
-            st.info("💡 Estes são os totais apenas dos autos que estão presentes em AMBAS as bases (SERASA e Dívida Ativa) com vencimento em 2025.")
+            st.info(f"💡 Estes são os totais apenas dos autos que estão presentes em AMBAS as bases (SERASA e Dívida Ativa) com vencimento em {ano_analise}.")
             
             if coluna_valor in df_serasa_comp.columns and coluna_valor in df_divida_comp.columns:
                 col1, col2, col3 = st.columns(3)
@@ -2086,39 +1461,39 @@ if 'resultados' in st.session_state:
             
             # Resumo de vencimentos - TOTAIS GERAIS
             st.markdown("---")
-            st.markdown("#### 📅 Resumo de Vencimentos - Totais Gerais (vencimento em 2025)")
-            st.warning("⚠️ **IMPORTANTE:** Estes são os totais de TODOS os autos de cada base com vencimento em 2025 (01/01 a 31/12).")
+            st.markdown(f"#### 📅 Resumo de Vencimentos - Totais Gerais (vencimento em {ano_analise})")
+            st.warning(f"⚠️ **IMPORTANTE:** Estes são os totais de TODOS os autos de cada base com vencimento em {ano_analise} (01/01 a 31/12).")
             col1, col2 = st.columns(2)
             
             with col1:
                 try:
-                    df_serasa_total = resultados['df_serasa_total_2025'].copy()
+                    df_serasa_total = resultados['df_serasa_total_ano'].copy()
                     if coluna_vencimento in df_serasa_total.columns:
                         venc_serasa = pd.to_datetime(df_serasa_total[coluna_vencimento], errors='coerce')
-                        data_limite = pd.Timestamp('2025-01-01')
-                        data_limite_fim = pd.Timestamp('2025-12-31')
+                        data_limite = pd.Timestamp(f'{ano_analise}-01-01')
+                        data_limite_fim = pd.Timestamp(f'{ano_analise}-12-31')
                         venc_serasa_filtrado = venc_serasa[(venc_serasa >= data_limite) & (venc_serasa <= data_limite_fim)]
                         if len(venc_serasa_filtrado) > 0:
                             st.markdown("**SERASA (Todos os autos):**")
                             st.write(f"- Primeiro vencimento: {venc_serasa_filtrado.min().strftime('%d/%m/%Y')}")
                             st.write(f"- Último vencimento: {venc_serasa_filtrado.max().strftime('%d/%m/%Y')}")
-                            st.write(f"- **Total com vencimento em 2025: {len(df_serasa_total):,} autos**")
+                            st.write(f"- **Total com vencimento em {ano_analise}: {len(df_serasa_total):,} autos**")
                 except Exception as e:
                     st.error(f"Erro ao processar vencimentos SERASA: {str(e)}")
             
             with col2:
                 try:
-                    df_divida_total = resultados['df_divida_total_2025'].copy()
+                    df_divida_total = resultados['df_divida_total_ano'].copy()
                     if coluna_vencimento in df_divida_total.columns:
                         venc_divida = pd.to_datetime(df_divida_total[coluna_vencimento], errors='coerce')
-                        data_limite = pd.Timestamp('2025-01-01')
-                        data_limite_fim = pd.Timestamp('2025-12-31')
+                        data_limite = pd.Timestamp(f'{ano_analise}-01-01')
+                        data_limite_fim = pd.Timestamp(f'{ano_analise}-12-31')
                         venc_divida_filtrado = venc_divida[(venc_divida >= data_limite) & (venc_divida <= data_limite_fim)]
                         if len(venc_divida_filtrado) > 0:
                             st.markdown("**Dívida Ativa (Todos os autos):**")
                             st.write(f"- Primeiro vencimento: {venc_divida_filtrado.min().strftime('%d/%m/%Y')}")
                             st.write(f"- Último vencimento: {venc_divida_filtrado.max().strftime('%d/%m/%Y')}")
-                            st.write(f"- **Total com vencimento em 2025: {len(df_divida_total):,} autos**")
+                            st.write(f"- **Total com vencimento em {ano_analise}: {len(df_divida_total):,} autos**")
                 except Exception as e:
                     st.error(f"Erro ao processar vencimentos Dívida Ativa: {str(e)}")
             
@@ -2243,209 +1618,6 @@ if 'resultados' in st.session_state:
             if df_export.empty:
                 st.warning("⚠️ Nenhum dado encontrado para exportar!")
             else:
-                # Função auxiliar para gerar Excel formatado
-                def gerar_excel_formatado(dados_df, nome_aba, nome_arquivo):
-                    """Gera arquivo Excel formatado a partir de um DataFrame.
-                    Remove linhas totalmente vazias e reindexa para evitar linhas em branco entre os dados."""
-                    if dados_df is None or dados_df.empty:
-                        return None
-                    # Remover linhas onde todos os valores são vazios ('' ou NaN) e reindexar
-                    dados_df = dados_df.replace('', np.nan).dropna(how='all').reset_index(drop=True)
-                    if dados_df.empty:
-                        return None
-                    buffer = io.BytesIO()
-                    try:
-                        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                            dados_df.to_excel(
-                                writer, 
-                                sheet_name=nome_aba, 
-                                index=False,
-                                header=True
-                            )
-                            
-                            worksheet = writer.sheets[nome_aba]
-                            
-                            # Aplicar formatação completa
-                            # Ajustar larguras das colunas baseado no número de colunas
-                            num_colunas = len(dados_df.columns)
-                            if num_colunas == 5:  # Auto, Protocolo, Data Vencimento, CPF/CNPJ, Valor
-                                worksheet.column_dimensions['A'].width = 25  # Auto de Infração
-                                worksheet.column_dimensions['B'].width = 20  # Número de Protocolo
-                                worksheet.column_dimensions['C'].width = 18  # Data de Vencimento
-                                worksheet.column_dimensions['D'].width = 18  # CPF/CNPJ
-                                worksheet.column_dimensions['E'].width = 15  # Valor
-                            elif num_colunas == 4:  # Auto, Protocolo, CPF/CNPJ, Valor (sem data) OU Auto, Data Vencimento, CPF/CNPJ, Valor (sem protocolo)
-                                # Verificar se tem protocolo ou data
-                                if 'Número de Protocolo' in dados_df.columns:
-                                    worksheet.column_dimensions['A'].width = 25  # Auto de Infração
-                                    worksheet.column_dimensions['B'].width = 20  # Número de Protocolo
-                                    worksheet.column_dimensions['C'].width = 18  # CPF/CNPJ
-                                    worksheet.column_dimensions['D'].width = 15  # Valor
-                                else:  # Tem Data de Vencimento mas não tem Protocolo
-                                    worksheet.column_dimensions['A'].width = 25  # Auto de Infração
-                                    worksheet.column_dimensions['B'].width = 18  # Data de Vencimento
-                                    worksheet.column_dimensions['C'].width = 18  # CPF/CNPJ
-                                    worksheet.column_dimensions['D'].width = 15  # Valor
-                            else:  # Auto, CPF/CNPJ, Valor (sem protocolo e sem data)
-                                worksheet.column_dimensions['A'].width = 25
-                                worksheet.column_dimensions['B'].width = 18
-                                worksheet.column_dimensions['C'].width = 15
-                            
-                            header_fill = PatternFill(start_color="1f4e79", end_color="1f4e79", fill_type="solid")
-                            header_font = Font(bold=True, color="FFFFFF", size=11)
-                            header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-                            align_left_center = Alignment(horizontal="left", vertical="center")
-                            align_center_center = Alignment(horizontal="center", vertical="center")
-                            align_right_center = Alignment(horizontal="right", vertical="center")
-                            
-                            for cell in worksheet[1]:
-                                cell.fill = header_fill
-                                cell.font = header_font
-                                cell.alignment = header_alignment
-                            
-                            # Formatar colunas
-                            thin_border = Border(
-                                left=Side(style='thin'),
-                                right=Side(style='thin'),
-                                top=Side(style='thin'),
-                                bottom=Side(style='thin')
-                            )
-                            
-                            # Determinar número de colunas e índices
-                            num_colunas = len(dados_df.columns)
-                            # Determinar índices das colunas baseado na estrutura
-                            tem_protocolo = 'Número de Protocolo' in dados_df.columns
-                            tem_data_venc = 'Data de Vencimento' in dados_df.columns
-                            tem_data_infracao = 'Data Infração' in dados_df.columns
-                            tem_modais = 'Modais' in dados_df.columns
-                            
-                            # Calcular índices das colunas (ordem: Auto, Protocolo, Data Venc, Data Infração, Modais, CPF/CNPJ, Valor, Valor (R$))
-                            col_names = list(dados_df.columns)
-                            idx_auto = 1
-                            idx_protocolo = 2 if tem_protocolo else None
-                            idx_data_venc = None
-                            idx_data_infracao = None
-                            idx_modais = None
-                            idx_cpf = None
-                            idx_valor = col_names.index('Valor') + 1 if 'Valor' in col_names else None
-                            tem_valor_r = 'Valor (R$)' in col_names
-                            idx_valor_r = col_names.index('Valor (R$)') + 1 if tem_valor_r else None
-                            tem_situacao_divida = 'Situação Dívida' in col_names
-                            idx_situacao_divida = col_names.index('Situação Dívida') + 1 if tem_situacao_divida else None
-                            tem_situacao_congelamento = 'Situação Congelamento' in col_names
-                            idx_situacao_congelamento = col_names.index('Situação Congelamento') + 1 if tem_situacao_congelamento else None
-                            tem_data_pagamento = 'Data Pagamento' in col_names
-                            idx_data_pagamento = col_names.index('Data Pagamento') + 1 if tem_data_pagamento else None
-                            tem_nome_autuado = 'Nome Autuado' in col_names
-                            idx_nome_autuado = col_names.index('Nome Autuado') + 1 if tem_nome_autuado else None
-                            tem_classificacao_autuado = 'Classificação Autuado' in col_names
-                            idx_classificacao_autuado = col_names.index('Classificação Autuado') + 1 if tem_classificacao_autuado else None
-                            tem_motivo_classificacao = 'Motivo Classificação' in col_names
-                            idx_motivo_classificacao = col_names.index('Motivo Classificação') + 1 if tem_motivo_classificacao else None
-                            tem_termo_identificado = 'Termo Identificado' in col_names
-                            idx_termo_identificado = col_names.index('Termo Identificado') + 1 if tem_termo_identificado else None
-                            
-                            # Calcular índices dinamicamente baseado nas colunas presentes
-                            col_idx = 1
-                            if tem_protocolo:
-                                col_idx += 1
-                            if tem_data_venc:
-                                idx_data_venc = col_idx
-                                col_idx += 1
-                            if tem_data_infracao:
-                                idx_data_infracao = col_idx
-                                col_idx += 1
-                            if tem_modais:
-                                idx_modais = col_idx
-                                col_idx += 1
-                            idx_cpf = col_idx
-                            
-                            for row in worksheet.iter_rows(min_row=1, max_row=worksheet.max_row, min_col=1, max_col=num_colunas):
-                                for cell in row:
-                                    cell.border = thin_border
-                                    if cell.column == idx_cpf and cell.row > 1:  # CPF/CNPJ
-                                        cell.number_format = '@'
-                                        cell.alignment = align_center_center
-                                    elif idx_valor and cell.column == idx_valor and cell.row > 1:  # Valor
-                                        if cell.value is not None:
-                                            cell.number_format = '#,##0.00'
-                                            cell.alignment = align_right_center
-                                    elif cell.column == idx_auto and cell.row > 1:  # Auto de Infração
-                                        cell.alignment = align_left_center
-                                    elif idx_protocolo and cell.column == idx_protocolo and cell.row > 1:  # Protocolo (se existir)
-                                        cell.alignment = align_left_center
-                                    elif idx_situacao_divida and cell.column == idx_situacao_divida and cell.row > 1:  # Situação Dívida (se existir)
-                                        cell.number_format = '@'
-                                        cell.alignment = align_left_center
-                                    elif idx_situacao_congelamento and cell.column == idx_situacao_congelamento and cell.row > 1:  # Situação Congelamento (se existir)
-                                        cell.number_format = '@'
-                                        cell.alignment = align_left_center
-                                    elif idx_data_pagamento and cell.column == idx_data_pagamento and cell.row > 1:  # Data Pagamento (se existir)
-                                        cell.number_format = '@'
-                                        cell.alignment = align_center_center
-                                    elif idx_nome_autuado and cell.column == idx_nome_autuado and cell.row > 1:  # Nome Autuado (se existir)
-                                        cell.number_format = '@'
-                                        cell.alignment = align_left_center
-                                    elif idx_classificacao_autuado and cell.column == idx_classificacao_autuado and cell.row > 1:  # Classificação Autuado (se existir)
-                                        cell.number_format = '@'
-                                        cell.alignment = align_left_center
-                                    elif idx_motivo_classificacao and cell.column == idx_motivo_classificacao and cell.row > 1:  # Motivo Classificação
-                                        cell.number_format = '@'
-                                        cell.alignment = align_left_center
-                                    elif idx_termo_identificado and cell.column == idx_termo_identificado and cell.row > 1:  # Termo Identificado
-                                        cell.number_format = '@'
-                                        cell.alignment = align_left_center
-                                    elif idx_data_venc and cell.column == idx_data_venc and cell.row > 1:  # Data de Vencimento (se existir)
-                                        cell.alignment = align_center_center
-                                        cell.number_format = '@'  # Formato texto para manter formato DD/MM/YYYY
-                                    elif idx_data_infracao and cell.column == idx_data_infracao and cell.row > 1:  # Data Infração (se existir)
-                                        cell.alignment = align_center_center
-                                        cell.number_format = '@'  # Formato texto para manter formato DD/MM/YYYY
-                                    elif idx_modais and cell.column == idx_modais and cell.row > 1:  # Modais (se existir)
-                                        cell.alignment = align_left_center
-                                        cell.number_format = '@'  # Formato texto
-                                    elif idx_valor_r and cell.column == idx_valor_r and cell.row > 1:  # Valor (R$) - texto
-                                        cell.number_format = '@'
-                                        cell.alignment = align_right_center
-                            
-                            # Largura da coluna Data Infração (quando presente)
-                            if tem_data_infracao and idx_data_infracao is not None and idx_data_infracao <= 26:
-                                col_letter_infracao = chr(64 + idx_data_infracao)
-                                worksheet.column_dimensions[col_letter_infracao].width = 18
-                            if tem_situacao_divida and idx_situacao_divida is not None and idx_situacao_divida <= 26:
-                                col_letter_sit = chr(64 + idx_situacao_divida)
-                                worksheet.column_dimensions[col_letter_sit].width = 22
-                            if tem_situacao_congelamento and idx_situacao_congelamento is not None and idx_situacao_congelamento <= 26:
-                                col_letter_cong = chr(64 + idx_situacao_congelamento)
-                                worksheet.column_dimensions[col_letter_cong].width = 22
-                            if tem_data_pagamento and idx_data_pagamento is not None and idx_data_pagamento <= 26:
-                                col_letter_pag = chr(64 + idx_data_pagamento)
-                                worksheet.column_dimensions[col_letter_pag].width = 18
-                            if tem_nome_autuado and idx_nome_autuado is not None and idx_nome_autuado <= 26:
-                                col_letter_nome = chr(64 + idx_nome_autuado)
-                                worksheet.column_dimensions[col_letter_nome].width = 40
-                            if tem_classificacao_autuado and idx_classificacao_autuado is not None and idx_classificacao_autuado <= 26:
-                                col_letter_cla = chr(64 + idx_classificacao_autuado)
-                                worksheet.column_dimensions[col_letter_cla].width = 28
-                            if tem_motivo_classificacao and idx_motivo_classificacao is not None and idx_motivo_classificacao <= 26:
-                                col_letter_motivo = chr(64 + idx_motivo_classificacao)
-                                worksheet.column_dimensions[col_letter_motivo].width = 38
-                            if tem_termo_identificado and idx_termo_identificado is not None and idx_termo_identificado <= 26:
-                                col_letter_termo = chr(64 + idx_termo_identificado)
-                                worksheet.column_dimensions[col_letter_termo].width = 28
-                            if tem_valor_r and idx_valor_r is not None and idx_valor_r <= 26:
-                                col_letter_valor_r = chr(64 + idx_valor_r)
-                                worksheet.column_dimensions[col_letter_valor_r].width = 15
-                            
-                            worksheet.freeze_panes = 'A2'
-                        
-                        buffer.seek(0)
-                        excel_data = buffer.getvalue()
-                        return excel_data
-                    except Exception as e:
-                        buffer.close()
-                        raise e
-                
                 # Função auxiliar para preparar dados de exportação
                 def preparar_dados_exportacao(df_base, filtro_valor=None):
                     """Prepara dados para exportação com filtro opcional por valor"""
@@ -2617,8 +1789,7 @@ if 'resultados' in st.session_state:
                                 dayfirst=True
                             )
                             colunas_export['Data de Vencimento'] = vencimento_dt.dt.strftime('%d/%m/%Y').fillna('')
-                        except:
-                            # Se falhar, usar como string
+                        except (ValueError, TypeError):
                             colunas_export['Data de Vencimento'] = df_filtrado[col_vencimento_encontrada].fillna('').astype(str).str.strip()
                     else:
                         # Se não encontrar, criar coluna vazia
@@ -3276,110 +2447,45 @@ if 'resultados' in st.session_state:
         
         col_exp1, col_exp2 = st.columns(2)
         
+        def _preparar_df_tab3(dados_base):
+            """Prepara DataFrame para exportação simplificada na Tab3."""
+            if dados_base is None or dados_base.empty:
+                return None
+            df = dados_base.copy()
+            if 'CPF_CNPJ_NORM' in df.columns:
+                contagem = df.groupby('CPF_CNPJ_NORM').size()
+                df['_QTD'] = df['CPF_CNPJ_NORM'].map(contagem).fillna(0)
+                df = df.sort_values(['_QTD', 'CPF_CNPJ_NORM'], ascending=[False, True]).drop(columns=['_QTD'])
+            if not (coluna_auto in df.columns and coluna_cpf_cnpj in df.columns and coluna_valor in df.columns):
+                return None
+            export = pd.DataFrame({'Auto de Infração': df[coluna_auto].fillna('').astype(str).str.strip()})
+            if coluna_protocolo in df.columns:
+                export['Número de Protocolo'] = df[coluna_protocolo].fillna('').astype(str).str.strip()
+            if coluna_vencimento in df.columns:
+                try:
+                    vdt = pd.to_datetime(df[coluna_vencimento], errors='coerce', dayfirst=True)
+                    export['Data de Vencimento'] = vdt.dt.strftime('%d/%m/%Y').fillna('')
+                except (ValueError, TypeError):
+                    export['Data de Vencimento'] = df[coluna_vencimento].fillna('').astype(str).str.strip()
+            export['CPF_CNPJ'] = df[coluna_cpf_cnpj].fillna('').astype(str).str.strip().apply(formatar_cpf_cnpj_brasileiro)
+            export['Valor'] = pd.to_numeric(df[coluna_valor], errors='coerce')
+            return export
+
         with col_exp1:
             st.markdown("##### 📥 Autos ≤ R$ 1.000,00")
             if not resultados['serasa_abaixo_1000_ind'].empty:
-                dados_abaixo_1000 = resultados['serasa_abaixo_1000_ind'].copy()
-                # Ordenar por quantidade de autos por CPF/CNPJ (maior para menor) e depois por CPF/CNPJ para agrupar autos do mesmo CNPJ
-                if 'CPF_CNPJ_NORM' in dados_abaixo_1000.columns:
-                    contagem_autos_abaixo = dados_abaixo_1000.groupby('CPF_CNPJ_NORM').size()
-                    dados_abaixo_1000['_QTD_AUTOS'] = dados_abaixo_1000['CPF_CNPJ_NORM'].map(contagem_autos_abaixo).fillna(0)
-                    dados_abaixo_1000 = dados_abaixo_1000.sort_values(['_QTD_AUTOS', 'CPF_CNPJ_NORM'], ascending=[False, True]).drop(columns=['_QTD_AUTOS'])
-                # Preparar dados para exportação
-                if coluna_auto in dados_abaixo_1000.columns and coluna_cpf_cnpj in dados_abaixo_1000.columns and coluna_valor in dados_abaixo_1000.columns:
-                    df_export_abaixo = pd.DataFrame({
-                        'Auto de Infração': dados_abaixo_1000[coluna_auto].fillna('').astype(str).str.strip(),
-                        'CPF_CNPJ': dados_abaixo_1000[coluna_cpf_cnpj].fillna('').astype(str).str.strip().apply(formatar_cpf_cnpj_brasileiro),
-                        'Valor': pd.to_numeric(dados_abaixo_1000[coluna_valor], errors='coerce')
-                    })
-                    # Adicionar coluna de Protocolo se existir no DataFrame
-                    if coluna_protocolo in dados_abaixo_1000.columns:
-                        df_export_abaixo.insert(1, 'Número de Protocolo', dados_abaixo_1000[coluna_protocolo].fillna('').astype(str).str.strip())
-                    # Adicionar coluna de Data de Vencimento se existir no DataFrame
-                    if coluna_vencimento in dados_abaixo_1000.columns:
-                        try:
-                            vencimento_dt = pd.to_datetime(
-                                dados_abaixo_1000[coluna_vencimento],
-                                errors='coerce',
-                                dayfirst=True
-                            )
-                            data_vencimento = vencimento_dt.dt.strftime('%d/%m/%Y').fillna('')
-                        except:
-                            data_vencimento = dados_abaixo_1000[coluna_vencimento].fillna('').astype(str).str.strip()
-                        # Inserir após Protocolo (se existir) ou após Auto de Infração
-                        posicao = 2 if coluna_protocolo in dados_abaixo_1000.columns else 1
-                        df_export_abaixo.insert(posicao, 'Data de Vencimento', data_vencimento)
-                    
-                    # Gerar Excel com formatação completa
-                    buffer_abaixo = io.BytesIO()
-                    with pd.ExcelWriter(buffer_abaixo, engine='openpyxl') as writer:
-                        df_export_abaixo.to_excel(writer, sheet_name='Autos_≤1000', index=False)
-                        worksheet = writer.sheets['Autos_≤1000']
-                        
-                        # Aplicar formatação completa
-                        num_colunas = len(df_export_abaixo.columns)
-                        tem_protocolo = 'Número de Protocolo' in df_export_abaixo.columns
-                        tem_data_venc = 'Data de Vencimento' in df_export_abaixo.columns
-                        
-                        if num_colunas == 5:  # Auto, Protocolo, Data Vencimento, CPF/CNPJ, Valor
-                            worksheet.column_dimensions['A'].width = 25  # Auto de Infração
-                            worksheet.column_dimensions['B'].width = 20  # Número de Protocolo
-                            worksheet.column_dimensions['C'].width = 18  # Data de Vencimento
-                            worksheet.column_dimensions['D'].width = 18  # CPF/CNPJ
-                            worksheet.column_dimensions['E'].width = 15  # Valor
-                        elif num_colunas == 4:  # Auto, Protocolo, CPF/CNPJ, Valor OU Auto, Data Vencimento, CPF/CNPJ, Valor
-                            worksheet.column_dimensions['A'].width = 25  # Auto de Infração
-                            worksheet.column_dimensions['B'].width = 20 if tem_protocolo else 18  # Protocolo ou Data
-                            worksheet.column_dimensions['C'].width = 18  # CPF/CNPJ ou Data
-                            worksheet.column_dimensions['D'].width = 15  # Valor
-                        else:  # Auto, CPF/CNPJ, Valor (sem protocolo e sem data)
-                            worksheet.column_dimensions['A'].width = 25
-                            worksheet.column_dimensions['B'].width = 18
-                            worksheet.column_dimensions['C'].width = 15
-                        
-                        header_fill = PatternFill(start_color="1f4e79", end_color="1f4e79", fill_type="solid")
-                        header_font = Font(bold=True, color="FFFFFF", size=11)
-                        header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-                        
-                        for cell in worksheet[1]:
-                            cell.fill = header_fill
-                            cell.font = header_font
-                            cell.alignment = header_alignment
-                        
-                        thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
-                        
-                        coluna_cpf_idx = 3 if num_colunas == 4 else 2
-                        coluna_valor_idx = 4 if num_colunas == 4 else 3
-                        
-                        for row in worksheet.iter_rows(min_row=1, max_row=worksheet.max_row, min_col=1, max_col=num_colunas):
-                            for cell in row:
-                                cell.border = thin_border
-                                if cell.column == coluna_cpf_idx and cell.row > 1:  # CPF/CNPJ
-                                    cell.number_format = '@'
-                                    cell.alignment = Alignment(horizontal="center", vertical="center")
-                                elif cell.column == coluna_valor_idx and cell.row > 1:  # Valor
-                                    if cell.value is not None:
-                                        cell.number_format = '#,##0.00'
-                                        cell.alignment = Alignment(horizontal="right", vertical="center")
-                                elif cell.column == 1 and cell.row > 1:  # Auto de Infração
-                                    cell.alignment = Alignment(horizontal="left", vertical="center")
-                                elif cell.column == 2 and num_colunas == 4 and cell.row > 1:  # Protocolo (se existir)
-                                    cell.alignment = Alignment(horizontal="left", vertical="center")
-                        
-                        worksheet.freeze_panes = 'A2'
-                    
-                    buffer_abaixo.seek(0)
-                    excel_abaixo = buffer_abaixo.getvalue()
-                    buffer_abaixo.close()
-                    
-                    st.download_button(
-                        label="📥 Download Autos ≤ R$ 1.000,00 (Excel)",
-                        data=excel_abaixo,
-                        file_name=f"Autos Ate 1000 {datetime.now().strftime('%d %m %Y %H:%M')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                        key="download_abaixo_1000"
-                    )
+                df_export_abaixo = _preparar_df_tab3(resultados['serasa_abaixo_1000_ind'])
+                if df_export_abaixo is not None:
+                    excel_abaixo = gerar_excel_formatado(df_export_abaixo, 'Autos_Ate_1000', 'tab3_abaixo')
+                    if excel_abaixo:
+                        st.download_button(
+                            label="📥 Download Autos ≤ R$ 1.000,00 (Excel)",
+                            data=excel_abaixo,
+                            file_name=f"Autos Ate 1000 {datetime.now().strftime('%d %m %Y %H:%M')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                            key="download_abaixo_1000"
+                        )
                     st.caption(f"📋 Total: {len(resultados['serasa_abaixo_1000_ind'])} autos de infração")
                 else:
                     st.warning("⚠️ Colunas necessárias não encontradas")
@@ -3389,131 +2495,18 @@ if 'resultados' in st.session_state:
         with col_exp2:
             st.markdown("##### 📥 Autos > R$ 1.000,00")
             if not resultados['serasa_acima_1000_ind'].empty:
-                dados_acima_1000 = resultados['serasa_acima_1000_ind'].copy()
-                # Ordenar por quantidade de autos por CPF/CNPJ (maior para menor) e depois por CPF/CNPJ para agrupar autos do mesmo CNPJ
-                if 'CPF_CNPJ_NORM' in dados_acima_1000.columns:
-                    contagem_autos_acima = dados_acima_1000.groupby('CPF_CNPJ_NORM').size()
-                    dados_acima_1000['_QTD_AUTOS'] = dados_acima_1000['CPF_CNPJ_NORM'].map(contagem_autos_acima).fillna(0)
-                    dados_acima_1000 = dados_acima_1000.sort_values(['_QTD_AUTOS', 'CPF_CNPJ_NORM'], ascending=[False, True]).drop(columns=['_QTD_AUTOS'])
-                # Preparar dados para exportação
-                if coluna_auto in dados_acima_1000.columns and coluna_cpf_cnpj in dados_acima_1000.columns and coluna_valor in dados_acima_1000.columns:
-                    df_export_acima = pd.DataFrame({
-                        'Auto de Infração': dados_acima_1000[coluna_auto].fillna('').astype(str).str.strip(),
-                        'CPF_CNPJ': dados_acima_1000[coluna_cpf_cnpj].fillna('').astype(str).str.strip().apply(formatar_cpf_cnpj_brasileiro),
-                        'Valor': pd.to_numeric(dados_acima_1000[coluna_valor], errors='coerce')
-                    })
-                    # Adicionar coluna de Protocolo se existir no DataFrame
-                    if coluna_protocolo in dados_acima_1000.columns:
-                        df_export_acima.insert(1, 'Número de Protocolo', dados_acima_1000[coluna_protocolo].fillna('').astype(str).str.strip())
-                    # Adicionar coluna de Data de Vencimento se existir no DataFrame
-                    if coluna_vencimento in dados_acima_1000.columns:
-                        try:
-                            vencimento_dt = pd.to_datetime(
-                                dados_acima_1000[coluna_vencimento],
-                                errors='coerce',
-                                dayfirst=True
-                            )
-                            data_vencimento = vencimento_dt.dt.strftime('%d/%m/%Y').fillna('')
-                        except:
-                            data_vencimento = dados_acima_1000[coluna_vencimento].fillna('').astype(str).str.strip()
-                        # Inserir após Protocolo (se existir) ou após Auto de Infração
-                        posicao = 2 if coluna_protocolo in dados_acima_1000.columns else 1
-                        df_export_acima.insert(posicao, 'Data de Vencimento', data_vencimento)
-                    
-                    # Gerar Excel com formatação completa
-                    buffer_acima = io.BytesIO()
-                    with pd.ExcelWriter(buffer_acima, engine='openpyxl') as writer:
-                        df_export_acima.to_excel(writer, sheet_name='Autos_>1000', index=False)
-                        worksheet = writer.sheets['Autos_>1000']
-                        
-                        # Aplicar formatação completa
-                        num_colunas = len(df_export_acima.columns)
-                        tem_protocolo = 'Número de Protocolo' in df_export_acima.columns
-                        tem_data_venc = 'Data de Vencimento' in df_export_acima.columns
-                        
-                        if num_colunas == 5:  # Auto, Protocolo, Data Vencimento, CPF/CNPJ, Valor
-                            worksheet.column_dimensions['A'].width = 25  # Auto de Infração
-                            worksheet.column_dimensions['B'].width = 20  # Número de Protocolo
-                            worksheet.column_dimensions['C'].width = 18  # Data de Vencimento
-                            worksheet.column_dimensions['D'].width = 18  # CPF/CNPJ
-                            worksheet.column_dimensions['E'].width = 15  # Valor
-                        elif num_colunas == 4:  # Auto, Protocolo, CPF/CNPJ, Valor OU Auto, Data Vencimento, CPF/CNPJ, Valor
-                            worksheet.column_dimensions['A'].width = 25  # Auto de Infração
-                            worksheet.column_dimensions['B'].width = 20 if tem_protocolo else 18  # Protocolo ou Data
-                            worksheet.column_dimensions['C'].width = 18  # CPF/CNPJ ou Data
-                            worksheet.column_dimensions['D'].width = 15  # Valor
-                        else:  # Auto, CPF/CNPJ, Valor (sem protocolo e sem data)
-                            worksheet.column_dimensions['A'].width = 25
-                            worksheet.column_dimensions['B'].width = 18
-                            worksheet.column_dimensions['C'].width = 15
-                        
-                        header_fill = PatternFill(start_color="1f4e79", end_color="1f4e79", fill_type="solid")
-                        header_font = Font(bold=True, color="FFFFFF", size=11)
-                        header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-                        
-                        for cell in worksheet[1]:
-                            cell.fill = header_fill
-                            cell.font = header_font
-                            cell.alignment = header_alignment
-                        
-                        thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
-                        
-                        # Calcular índices das colunas (ordem: Auto, Protocolo, Data Venc, Modais, CPF/CNPJ, Valor)
-                        tem_modais = 'Modais' in df_export_acima.columns
-                        idx_auto = 1
-                        idx_protocolo = 2 if tem_protocolo else None
-                        idx_data_venc = None
-                        idx_modais = None
-                        idx_cpf = None
-                        idx_valor = num_colunas
-                        
-                        # Calcular índices dinamicamente baseado nas colunas presentes
-                        col_idx = 1
-                        if tem_protocolo:
-                            col_idx += 1
-                        if tem_data_venc:
-                            idx_data_venc = col_idx
-                            col_idx += 1
-                        if tem_modais:
-                            idx_modais = col_idx
-                            col_idx += 1
-                        idx_cpf = col_idx
-                        
-                        for row in worksheet.iter_rows(min_row=1, max_row=worksheet.max_row, min_col=1, max_col=num_colunas):
-                            for cell in row:
-                                cell.border = thin_border
-                                if cell.column == idx_cpf and cell.row > 1:  # CPF/CNPJ
-                                    cell.number_format = '@'
-                                    cell.alignment = Alignment(horizontal="center", vertical="center")
-                                elif cell.column == idx_valor and cell.row > 1:  # Valor
-                                    if cell.value is not None:
-                                        cell.number_format = '#,##0.00'
-                                        cell.alignment = Alignment(horizontal="right", vertical="center")
-                                elif cell.column == idx_auto and cell.row > 1:  # Auto de Infração
-                                    cell.alignment = Alignment(horizontal="left", vertical="center")
-                                elif idx_protocolo and cell.column == idx_protocolo and cell.row > 1:  # Protocolo (se existir)
-                                    cell.alignment = Alignment(horizontal="left", vertical="center")
-                                elif idx_data_venc and cell.column == idx_data_venc and cell.row > 1:  # Data de Vencimento (se existir)
-                                    cell.alignment = Alignment(horizontal="center", vertical="center")
-                                    cell.number_format = '@'  # Formato texto para manter formato DD/MM/YYYY
-                                elif idx_modais and cell.column == idx_modais and cell.row > 1:  # Modais (se existir)
-                                    cell.alignment = Alignment(horizontal="left", vertical="center")
-                                    cell.number_format = '@'  # Formato texto
-                        
-                        worksheet.freeze_panes = 'A2'
-                    
-                    buffer_acima.seek(0)
-                    excel_acima = buffer_acima.getvalue()
-                    buffer_acima.close()
-                    
-                    st.download_button(
-                        label="📥 Download Autos > R$ 1.000,00 (Excel)",
-                        data=excel_acima,
-                        file_name=f"Autos Acima 1000 {datetime.now().strftime('%d %m %Y %H:%M')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                        key="download_acima_1000_tab3"
-                    )
+                df_export_acima = _preparar_df_tab3(resultados['serasa_acima_1000_ind'])
+                if df_export_acima is not None:
+                    excel_acima = gerar_excel_formatado(df_export_acima, 'Autos_Acima_1000', 'tab3_acima')
+                    if excel_acima:
+                        st.download_button(
+                            label="📥 Download Autos > R$ 1.000,00 (Excel)",
+                            data=excel_acima,
+                            file_name=f"Autos Acima 1000 {datetime.now().strftime('%d %m %Y %H:%M')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                            key="download_acima_1000_tab3"
+                        )
                     st.caption(f"📋 Total: {len(resultados['serasa_acima_1000_ind'])} autos de infração")
                 else:
                     st.warning("⚠️ Colunas necessárias não encontradas")
@@ -3623,7 +2616,79 @@ if 'resultados' in st.session_state:
                 st.dataframe(resultados['df_cpf_apenas_divida'], use_container_width=True, height=300)
             elif resultados['cpf_apenas_divida'] == 0:
                 st.success("✅ Todos os CPF/CNPJ da Dívida Ativa possuem correspondência na SERASA!")
-    
+
+    with tab5:
+        st.markdown("### 📜 Histórico de Comparações")
+        st.info("Registros das análises anteriores e download dos arquivos exportados.")
+
+        if not st.session_state.get('_historico_salvo', True) and resultados:
+            try:
+                config_hist = {
+                    "coluna_auto": st.session_state.get('coluna_auto', ''),
+                    "coluna_cpf_cnpj": st.session_state.get('coluna_cpf_cnpj', ''),
+                    "coluna_valor": st.session_state.get('coluna_valor', ''),
+                    "coluna_vencimento": st.session_state.get('coluna_vencimento', ''),
+                    "coluna_protocolo": st.session_state.get('coluna_protocolo', ''),
+                    "coluna_modal_serasa": st.session_state.get('coluna_modal_serasa', ''),
+                    "coluna_modal_divida": st.session_state.get('coluna_modal_divida', ''),
+                }
+                excel_hist = {}
+                export_run_id = st.session_state.get('export_run_id', '')
+                for key, val in st.session_state.items():
+                    if key.startswith(f"export_payload::{export_run_id}::") and isinstance(val, dict) and val.get('excel'):
+                        nome = key.split("::")[-1]
+                        excel_hist[f"{nome}.xlsx"] = val['excel']
+                save_run(
+                    resultados,
+                    st.session_state.get('nome_arquivo_serasa', 'SERASA'),
+                    st.session_state.get('nome_arquivo_divida', 'Dívida Ativa'),
+                    st.session_state.get('ano_analise', datetime.now().year),
+                    config_hist,
+                    excel_dict=excel_hist if excel_hist else None,
+                )
+                st.session_state['_historico_salvo'] = True
+            except (OSError, sqlite3.Error, TypeError, ValueError) as e:
+                st.warning(f"Não foi possível salvar no histórico: {e}")
+
+        try:
+            runs = list_runs()
+        except (sqlite3.Error, OSError):
+            runs = []
+
+        if not runs:
+            st.caption("Nenhuma comparação registrada ainda.")
+        else:
+            for run in runs:
+                titulo = f"{run['data_hora']}  |  {run['nome_base_serasa']} × {run['nome_base_divida']}  |  Ano {run.get('ano_analise', '?')}"
+                with st.expander(titulo, expanded=False):
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Autos SERASA", f"{run['total_serasa']:,}")
+                    c2.metric("Autos Dívida", f"{run['total_divida']:,}")
+                    c3.metric("Em ambas", f"{run['autos_em_ambas']:,}")
+
+                    detalhes = get_run(run['id'])
+                    if detalhes and detalhes.get('arquivos'):
+                        st.markdown("**Arquivos exportados:**")
+                        for arq in detalhes['arquivos']:
+                            if arq.suffix in ('.xlsx', '.xls'):
+                                try:
+                                    arq_bytes = arq.read_bytes()
+                                    st.download_button(
+                                        label=f"📥 {arq.name}",
+                                        data=arq_bytes,
+                                        file_name=arq.name,
+                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                        key=f"hist_{run['id']}_{arq.name}",
+                                    )
+                                except Exception:
+                                    st.caption(f"Arquivo indisponível: {arq.name}")
+
+                    if st.button("🗑️ Excluir", key=f"del_{run['id']}"):
+                        if excluir_run(run['id']):
+                            st.success("Registro excluído.")
+                            st.rerun()
+                        else:
+                            st.error("Erro ao excluir.")
 
 else:
     st.info("👆 Por favor, faça o upload das duas planilhas na barra lateral para iniciar a análise.")
@@ -3646,7 +2711,7 @@ else:
         ### Funcionalidades:
         - ✅ **Análise principal por Auto de Infração** (chave de comparação)
         - ✅ Cruzamento automático entre bases baseado em autos
-        - ✅ Filtro por ano de vencimento (2025 em diante)
+        - ✅ Filtro por ano de vencimento (configurável na sidebar)
         - ✅ Agrupamento por CPF/CNPJ (análise adicional)
         - ✅ Separação por valores SERASA (≤ R$ 1.000 e > R$ 1.000)
         - ✅ Visualização de autos de infração correspondentes
