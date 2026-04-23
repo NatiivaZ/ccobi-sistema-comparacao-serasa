@@ -1,21 +1,30 @@
-"""Funções utilitárias de normalização e formatação para o Sistema de Comparação SERASA."""
+"""Utilitários mais usados no comparador SERASA."""
 
 import pandas as pd
-import numpy as np
-import re
-import unicodedata
+
+
+def _limpar_documento(valor):
+    """Tira a pontuação mais comum de CPF/CNPJ sem inventar regra nova."""
+    return str(valor).replace(".", "").replace("-", "").replace("/", "").strip()
+
+
+def _normalizar_modal(valor):
+    """Padroniza o modal em caixa alta quando vier algo aproveitável."""
+    if pd.notna(valor) and str(valor).strip() != "":
+        return str(valor).strip().upper()
+    return None
 
 
 def normalizar_cpf_cnpj(valor):
-    """Remove formatação de CPF/CNPJ, mantendo apenas dígitos."""
+    """Deixa o documento só com números para facilitar comparação."""
     if pd.isna(valor):
         return None
-    valor_str = str(valor).replace('.', '').replace('-', '').replace('/', '').strip()
+    valor_str = _limpar_documento(valor)
     return valor_str if valor_str else None
 
 
 def normalizar_auto(valor):
-    """Normaliza Auto de Infração para comparação (strip + upper + espaços)."""
+    """Padroniza o auto para evitar diferença só por espaço ou caixa."""
     if pd.isna(valor):
         return None
     valor_str = str(valor).strip().upper()
@@ -24,12 +33,10 @@ def normalizar_auto(valor):
 
 
 def converter_valor_sql(valor):
-    """
-    Converte valor de texto para decimal seguindo a lógica do SQL:
-    TRY_CONVERT(decimal(18,2), REPLACE(REPLACE(REPLACE(REPLACE([Valor], 'R$', ''), ' ', ''), '.', ''), ',', '.'))
+    """Converte o valor seguindo a mesma ideia da consulta usada antes.
 
-    Se o valor já for numérico (int/float), retorna diretamente SEM
-    manipulação de string, evitando o bug onde "241.11" -> remove '.' -> "24111".
+    O cuidado aqui é não tratar número que já veio como `int` ou `float`
+    como se fosse texto, porque isso distorce valores com ponto decimal.
     """
     if pd.isna(valor):
         return None
@@ -48,10 +55,10 @@ def converter_valor_sql(valor):
 
 
 def formatar_cpf_cnpj_brasileiro(valor):
-    """Formata CPF (XXX.XXX.XXX-XX) ou CNPJ (XX.XXX.XXX/XXXX-XX)."""
+    """Formata CPF ou CNPJ para exibição no padrão brasileiro."""
     if pd.isna(valor) or valor == '' or valor is None:
         return ''
-    valor_str = str(valor).replace('.', '').replace('-', '').replace('/', '').strip()
+    valor_str = _limpar_documento(valor)
     if not valor_str or not valor_str.isdigit():
         return str(valor)
     if len(valor_str) == 11:
@@ -62,7 +69,7 @@ def formatar_cpf_cnpj_brasileiro(valor):
 
 
 def formatar_valor_br(valor):
-    """Formata valor numérico no padrão brasileiro: R$ 1.234,56 ou R$ 0,00 para zero/nulo."""
+    """Formata número no padrão brasileiro sem complicar os casos nulos."""
     if valor is None or pd.isna(valor):
         return "R$ 0,00"
     try:
@@ -76,9 +83,9 @@ def formatar_valor_br(valor):
 
 
 def normalizar_e_mesclar_modais(modal_serasa, modal_divida):
-    """Normaliza e mescla modais de ambas as bases, padronizando para maiúsculas."""
-    modal_serasa_str = str(modal_serasa).strip().upper() if pd.notna(modal_serasa) and str(modal_serasa).strip() != '' else None
-    modal_divida_str = str(modal_divida).strip().upper() if pd.notna(modal_divida) and str(modal_divida).strip() != '' else None
+    """Junta os modais das duas bases em um texto só, já padronizado."""
+    modal_serasa_str = _normalizar_modal(modal_serasa)
+    modal_divida_str = _normalizar_modal(modal_divida)
 
     if modal_serasa_str and modal_divida_str:
         if modal_serasa_str == modal_divida_str:
@@ -94,7 +101,7 @@ def normalizar_e_mesclar_modais(modal_serasa, modal_divida):
 
 
 def resolver_coluna_vencimento(df, coluna_vencimento):
-    """Resolve a coluna de vencimento com variações de nome e sufixo (_serasa/_divida)."""
+    """Tenta achar a coluna de vencimento mesmo quando o nome varia um pouco."""
     if df is None or df.empty:
         return None
     colunas = list(df.columns)

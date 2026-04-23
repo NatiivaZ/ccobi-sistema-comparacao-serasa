@@ -1,4 +1,4 @@
-"""Cálculo de decadência de autos de infração para o Sistema de Comparação SERASA."""
+"""Cálculo de decadência usado no comparador."""
 
 import pandas as pd
 import unicodedata
@@ -13,7 +13,7 @@ _MODAIS_COM_DECADENCIA = ['EXCESSO DE PESO', 'EVASAO DE PEDAGIO']
 
 
 def _easter_year(ano):
-    """Retorna a data do domingo de Páscoa no ano dado (algoritmo de Butcher/Meeus)."""
+    """Calcula a data da Páscoa no ano informado."""
     a = ano % 19
     b = ano // 100
     c = ano % 100
@@ -32,7 +32,7 @@ def _easter_year(ano):
 
 
 def _feriados_nacionais_brasil(ano):
-    """Retorna set de datas dos feriados nacionais do Brasil no ano."""
+    """Monta os feriados nacionais que entram na conta de prazo."""
     pascoa = _easter_year(ano)
     feriados = {
         date(ano, 1, 1), date(ano, 4, 21), date(ano, 5, 1),
@@ -47,7 +47,7 @@ def _feriados_nacionais_brasil(ano):
 
 
 def _resolver_coluna_data(df, nome_base):
-    """Retorna o nome da coluna de data no DataFrame (com ou sem sufixo _serasa/_divida)."""
+    """Procura a coluna de data com ou sem sufixo das bases."""
     if nome_base in df.columns:
         return nome_base
     if f"{nome_base}_serasa" in df.columns:
@@ -58,7 +58,7 @@ def _resolver_coluna_data(df, nome_base):
 
 
 def _modal_tem_decadencia(modal_str):
-    """Retorna True se o modal se enquadra nos tipos com cálculo de decadência."""
+    """Diz se o modal entra na regra de decadência usada aqui."""
     if not modal_str or (isinstance(modal_str, float)):
         return False
     m = unicodedata.normalize('NFD', str(modal_str).upper().strip())
@@ -67,9 +67,10 @@ def _modal_tem_decadencia(modal_str):
 
 
 def calcular_situacao_decadente(df, coluna_modal=None):
-    """
-    Calcula a coluna [Situação decadente] com base nas datas da SERASA.
-    Retorna Series: '' | 'Decadente autuação' | 'Decadente multa' | 'Decadente autuação e multa'.
+    """Calcula a situação decadente de cada linha.
+
+    O retorno vem no mesmo formato já usado no app: vazio, decadente de
+    autuação, de multa ou dos dois.
     """
     col_infracao = _resolver_coluna_data(df, "Data Infração")
     col_notif_autuacao = _resolver_coluna_data(df, "Data Primeira Notificação Autuação")

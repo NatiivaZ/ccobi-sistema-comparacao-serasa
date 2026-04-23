@@ -1,4 +1,8 @@
-"""Lógica de classificação de autuados (órgão, banco, leasing) para o Sistema de Comparação SERASA."""
+"""Regras de classificação do nome do autuado.
+
+Aqui fica a separação entre quem pode cobrar normalmente e os casos como órgão,
+banco ou leasing.
+"""
 
 import pandas as pd
 import re
@@ -9,7 +13,7 @@ from pathlib import Path
 _session_config_getter = None
 
 def set_session_config_getter(fn):
-    """Registra função que obtém a config de classificação do session_state (Streamlit)."""
+    """Guarda uma função para ler a configuração atual direto do session_state."""
     global _session_config_getter
     _session_config_getter = fn
 
@@ -26,7 +30,7 @@ EXCECOES_FIXAS_PODE_COBRAR = ["SAFRA"]
 
 
 def carregar_config_classificacao():
-    """Carrega configurações persistidas da classificação de autuados."""
+    """Carrega o arquivo de configuração da classificação, se ele existir."""
     try:
         if CONFIG_CLASSIFICACAO_PATH.exists():
             data = json.loads(CONFIG_CLASSIFICACAO_PATH.read_text(encoding="utf-8"))
@@ -42,7 +46,7 @@ def carregar_config_classificacao():
 
 
 def salvar_config_classificacao(config):
-    """Salva configurações persistidas da classificação de autuados."""
+    """Salva a configuração já limpa para a próxima execução do app."""
     config_limpo = {}
     for chave, valor in DEFAULT_CLASSIFICACAO_CONFIG.items():
         itens = config.get(chave, valor)
@@ -57,14 +61,14 @@ def salvar_config_classificacao(config):
 
 
 def parse_lista_multilinha(texto):
-    """Converte textarea em lista de termos."""
+    """Transforma o texto da interface em lista simples de termos."""
     if not texto:
         return []
     return [linha.strip() for linha in str(texto).splitlines() if linha.strip()]
 
 
 def _normalizar_texto_para_busca(texto):
-    """Remove acentos, padroniza separadores e adiciona espaços nas bordas."""
+    """Normaliza o texto para comparação sem depender de acento ou pontuação."""
     if not texto or (isinstance(texto, float) and pd.isna(texto)):
         return ""
     s = unicodedata.normalize("NFD", str(texto).strip().upper())
@@ -75,7 +79,7 @@ def _normalizar_texto_para_busca(texto):
 
 
 def _contem_expressao(texto_norm, expressao):
-    """Confere expressao completa, evitando falso positivo por pedaço de palavra."""
+    """Procura a expressão inteira para evitar falso positivo por pedaço de palavra."""
     expr_norm = _normalizar_texto_para_busca(expressao)
     return bool(expr_norm) and expr_norm in texto_norm
 
@@ -127,7 +131,7 @@ _NOMES_BANCOS_ESPECIFICOS = [
 
 
 def obter_config_classificacao_ativa():
-    """Retorna a configuração ativa da classificação de autuados."""
+    """Usa a configuração da sessão quando existir; senão, volta para o arquivo."""
     if _session_config_getter:
         config = _session_config_getter()
         if isinstance(config, dict):
@@ -136,7 +140,7 @@ def obter_config_classificacao_ativa():
 
 
 def _lista_regras_classificacao(config):
-    """Monta as listas efetivas de regras combinando defaults + extras."""
+    """Junta as regras padrão com os termos extras cadastrados na interface."""
     config = config or DEFAULT_CLASSIFICACAO_CONFIG
     return {
         "orgao": _EXPRESSOES_ORGAO + list(config.get("extras_orgao", [])),
@@ -147,7 +151,7 @@ def _lista_regras_classificacao(config):
 
 
 def classificar_autuado_detalhado(nome, config=None):
-    """Retorna (classificacao, motivo, termo_encontrado) para o nome do autuado."""
+    """Classifica um nome e devolve também o motivo e o termo que bateu."""
     texto_norm = _normalizar_texto_para_busca(nome)
     if not texto_norm:
         return "Pode cobrar", "Nome vazio ou não informado", ""
@@ -174,17 +178,14 @@ def classificar_autuado_detalhado(nome, config=None):
 
 
 def classificar_autuado(nome):
-    """Wrapper simples para manter compatibilidade com chamadas antigas."""
+    """Mantém compatibilidade com chamadas antigas que esperam só a classificação."""
     config = obter_config_classificacao_ativa()
     classificacao, _, _ = classificar_autuado_detalhado(nome, config=config)
     return classificacao
 
 
 def filtrar_autuados_cobraveis(df_base, coluna_nome_autuado):
-    """
-    Remove da base os autuados classificados como Órgão, Banco ou Leasing.
-    Exceções configuradas (como SAFRA) permanecem na base.
-    """
+    """Filtra a base para deixar só quem segue como "Pode cobrar"."""
     if df_base is None or df_base.empty or not coluna_nome_autuado or coluna_nome_autuado not in df_base.columns:
         return df_base
 

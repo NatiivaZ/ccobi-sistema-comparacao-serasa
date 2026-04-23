@@ -1,9 +1,102 @@
 """Geração de arquivos Excel formatados para o Sistema de Comparação SERASA."""
 
 import io
+from datetime import date, datetime
+
 import numpy as np
 import pandas as pd
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+
+COLUNAS_DATA_EXCEL = {"Data de Vencimento", "Data Infração", "Data Pagamento"}
+COLUNAS_MOEDA_EXCEL = {"Valor", "Valor (R$)"}
+FORMATO_MOEDA_EXCEL = '"R$" #,##0.00'
+
+
+def _converter_valor_data_excel(valor):
+    """Converte valores comuns de planilha em datas reais do Excel."""
+    if pd.isna(valor):
+        return pd.NaT
+
+    if isinstance(valor, pd.Timestamp):
+        return valor.normalize()
+
+    if isinstance(valor, (datetime, date)):
+        return pd.Timestamp(valor).normalize()
+
+    if isinstance(valor, (int, float, np.integer, np.floating)):
+        valor_float = float(valor)
+        if 1 <= valor_float <= 2958465:
+            return (pd.Timestamp("1899-12-30") + pd.to_timedelta(valor_float, unit="D")).normalize()
+
+    texto = str(valor).strip()
+    if not texto:
+        return pd.NaT
+
+    return pd.to_datetime(texto, errors="coerce", dayfirst=True)
+
+
+def _preparar_colunas_data_para_excel(dados_df):
+    """Transforma colunas de data em datetime para o Excel agrupar corretamente."""
+    dados_excel = dados_df.copy()
+
+    for coluna in COLUNAS_DATA_EXCEL.intersection(dados_excel.columns):
+        serie_original = dados_excel[coluna]
+        mascara_preenchida = serie_original.notna() & serie_original.astype("string").str.strip().ne("")
+        if not mascara_preenchida.any():
+            continue
+
+        serie_convertida = serie_original.map(_converter_valor_data_excel)
+        if serie_convertida.notna().sum() != mascara_preenchida.sum():
+            continue
+
+        dados_excel[coluna] = serie_convertida
+
+    return dados_excel
+
+
+def _converter_valor_moeda_excel(valor):
+    """Converte textos monetários em número real para o Excel."""
+    if pd.isna(valor):
+        return np.nan
+
+    if isinstance(valor, (int, float, np.integer, np.floating)):
+        return float(valor)
+
+    texto = str(valor).strip()
+    if not texto:
+        return np.nan
+
+    texto = (
+        texto.replace("R$", "")
+        .replace(".", "")
+        .replace(",", ".")
+        .strip()
+    )
+
+    try:
+        return float(texto)
+    except ValueError:
+        return np.nan
+
+
+def _preparar_colunas_moeda_para_excel(dados_df):
+    """Transforma colunas monetárias em número para o Excel aplicar moeda real."""
+    dados_excel = dados_df.copy()
+
+    for coluna in COLUNAS_MOEDA_EXCEL.intersection(dados_excel.columns):
+        serie_original = dados_excel[coluna]
+        mascara_preenchida = serie_original.notna() & serie_original.astype("string").str.strip().ne("")
+        if not mascara_preenchida.any():
+            continue
+
+        serie_convertida = serie_original.map(_converter_valor_moeda_excel)
+        if serie_convertida.notna().sum() != mascara_preenchida.sum():
+            continue
+
+        dados_excel[coluna] = serie_convertida
+
+    return dados_excel
 
 
 def gerar_excel_formatado(dados_df, nome_aba, nome_arquivo):
@@ -14,10 +107,12 @@ def gerar_excel_formatado(dados_df, nome_aba, nome_arquivo):
     dados_df = dados_df.replace('', np.nan).dropna(how='all').reset_index(drop=True)
     if dados_df.empty:
         return None
+    dados_excel = _preparar_colunas_data_para_excel(dados_df)
+    dados_excel = _preparar_colunas_moeda_para_excel(dados_excel)
     buffer = io.BytesIO()
     try:
         with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            dados_df.to_excel(
+            dados_excel.to_excel(
                 writer,
                 sheet_name=nome_aba,
                 index=False,
@@ -26,7 +121,7 @@ def gerar_excel_formatado(dados_df, nome_aba, nome_arquivo):
 
             worksheet = writer.sheets[nome_aba]
 
-            num_colunas = len(dados_df.columns)
+            num_colunas = len(dados_excel.columns)
             if num_colunas == 5:
                 worksheet.column_dimensions['A'].width = 25
                 worksheet.column_dimensions['B'].width = 20
@@ -34,7 +129,7 @@ def gerar_excel_formatado(dados_df, nome_aba, nome_arquivo):
                 worksheet.column_dimensions['D'].width = 18
                 worksheet.column_dimensions['E'].width = 15
             elif num_colunas == 4:
-                if 'Número de Protocolo' in dados_df.columns:
+                if 'Número de Protocolo' in dados_excel.columns:
                     worksheet.column_dimensions['A'].width = 25
                     worksheet.column_dimensions['B'].width = 20
                     worksheet.column_dimensions['C'].width = 18
@@ -68,13 +163,13 @@ def gerar_excel_formatado(dados_df, nome_aba, nome_arquivo):
                 bottom=Side(style='thin')
             )
 
-            num_colunas = len(dados_df.columns)
-            tem_protocolo = 'Número de Protocolo' in dados_df.columns
-            tem_data_venc = 'Data de Vencimento' in dados_df.columns
-            tem_data_infracao = 'Data Infração' in dados_df.columns
-            tem_modais = 'Modais' in dados_df.columns
+            num_colunas = len(dados_excel.columns)
+            tem_protocolo = 'Número de Protocolo' in dados_excel.columns
+            tem_data_venc = 'Data de Vencimento' in dados_excel.columns
+            tem_data_infracao = 'Data Infração' in dados_excel.columns
+            tem_modais = 'Modais' in dados_excel.columns
 
-            col_names = list(dados_df.columns)
+            col_names = list(dados_excel.columns)
             idx_auto = 1
             idx_protocolo = 2 if tem_protocolo else None
             idx_data_venc = None
@@ -123,7 +218,7 @@ def gerar_excel_formatado(dados_df, nome_aba, nome_arquivo):
                         cell.alignment = align_center_center
                     elif idx_valor and cell.column == idx_valor and cell.row > 1:
                         if cell.value is not None:
-                            cell.number_format = '#,##0.00'
+                            cell.number_format = FORMATO_MOEDA_EXCEL
                             cell.alignment = align_right_center
                     elif cell.column == idx_auto and cell.row > 1:
                         cell.alignment = align_left_center
@@ -136,7 +231,7 @@ def gerar_excel_formatado(dados_df, nome_aba, nome_arquivo):
                         cell.number_format = '@'
                         cell.alignment = align_left_center
                     elif idx_data_pagamento and cell.column == idx_data_pagamento and cell.row > 1:
-                        cell.number_format = '@'
+                        cell.number_format = 'dd/mm/yyyy'
                         cell.alignment = align_center_center
                     elif idx_nome_autuado and cell.column == idx_nome_autuado and cell.row > 1:
                         cell.number_format = '@'
@@ -152,15 +247,15 @@ def gerar_excel_formatado(dados_df, nome_aba, nome_arquivo):
                         cell.alignment = align_left_center
                     elif idx_data_venc and cell.column == idx_data_venc and cell.row > 1:
                         cell.alignment = align_center_center
-                        cell.number_format = '@'
+                        cell.number_format = 'dd/mm/yyyy'
                     elif idx_data_infracao and cell.column == idx_data_infracao and cell.row > 1:
                         cell.alignment = align_center_center
-                        cell.number_format = '@'
+                        cell.number_format = 'dd/mm/yyyy'
                     elif idx_modais and cell.column == idx_modais and cell.row > 1:
                         cell.alignment = align_left_center
                         cell.number_format = '@'
                     elif idx_valor_r and cell.column == idx_valor_r and cell.row > 1:
-                        cell.number_format = '@'
+                        cell.number_format = FORMATO_MOEDA_EXCEL
                         cell.alignment = align_right_center
                     elif idx_situacao_decadente and cell.column == idx_situacao_decadente and cell.row > 1:
                         cell.number_format = '@'

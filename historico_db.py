@@ -1,6 +1,6 @@
-"""
-Histórico de comparações SERASA × Dívida Ativa: SQLite (metadados) + pasta com Excel exportados.
-Adaptado do padrão do DIVIDAv2.
+"""Persistência do histórico do comparador.
+
+Fica tudo aqui: metadados no SQLite e arquivos exportados em pasta separada.
 """
 
 import json
@@ -9,8 +9,6 @@ import uuid
 from pathlib import Path
 from datetime import datetime
 
-import pandas as pd
-
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "historico_comparacoes.db"
 PASTA_EXPORTACOES = BASE_DIR / "historico_exportacoes"
@@ -18,6 +16,30 @@ PASTA_EXPORTACOES = BASE_DIR / "historico_exportacoes"
 
 def _conectar():
     return sqlite3.connect(str(DB_PATH))
+
+
+def _serializar_json(payload):
+    """Serializa o que vai para o banco sem perder acentuação."""
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _listar_arquivos_exportados(pasta):
+    """Lista os arquivos da execução em uma ordem estável para a tela."""
+    if pasta and pasta.is_dir():
+        return sorted(pasta.iterdir())
+    return []
+
+
+def _remover_pasta_exportacao(pasta):
+    """Apaga a pasta da execução sem travar a exclusão por detalhe menor."""
+    if not (pasta and isinstance(pasta, Path) and pasta.is_dir()):
+        return
+    import shutil
+
+    try:
+        shutil.rmtree(pasta)
+    except Exception:
+        pass
 
 
 def init_db():
@@ -57,26 +79,7 @@ def save_run(
     config,
     excel_dict=None,
 ):
-    """
-    Salva uma comparação no SQLite e grava os Excel na pasta historico_exportacoes/<id>/.
-
-    Parameters
-    ----------
-    resultados : dict
-        Dicionário retornado por analisar_bases.
-    nome_base_serasa / nome_base_divida : str
-        Nomes dos arquivos enviados.
-    ano_analise : int
-        Ano usado no filtro.
-    config : dict
-        Configurações de colunas usadas na análise.
-    excel_dict : dict[str, bytes] | None
-        Mapa {nome_arquivo: bytes} dos Excel gerados.
-
-    Returns
-    -------
-    str  run_id
-    """
+    """Salva uma execução completa da comparação e devolve o `run_id`."""
     init_db()
     run_id = uuid.uuid4().hex
     data_hora = datetime.now().isoformat(sep=" ", timespec="seconds")
@@ -106,8 +109,8 @@ def save_run(
             if bytes_excel:
                 (pasta_run / nome_arquivo).write_bytes(bytes_excel)
 
-    config_json = json.dumps(config, ensure_ascii=False)
-    resumo_json = json.dumps(resumo, ensure_ascii=False)
+    config_json = _serializar_json(config)
+    resumo_json = _serializar_json(resumo)
 
     conn = _conectar()
     try:
@@ -140,7 +143,7 @@ def save_run(
 
 
 def list_runs():
-    """Lista todas as comparações (mais recente primeiro). Retorna lista de dicts."""
+    """Lista as execuções mais recentes primeiro para preencher o histórico."""
     init_db()
     conn = _conectar()
     try:
@@ -174,7 +177,7 @@ def list_runs():
 
 
 def get_run(run_id):
-    """Retorna dict completo da run ou None."""
+    """Busca uma execução completa pelo id."""
     conn = _conectar()
     try:
         cur = conn.execute(
@@ -193,7 +196,7 @@ def get_run(run_id):
             return None
 
         pasta = Path(row[14]) if row[14] else None
-        arquivos = sorted(pasta.iterdir()) if pasta and pasta.is_dir() else []
+        arquivos = _listar_arquivos_exportados(pasta)
 
         return {
             "id": run_id,
@@ -219,7 +222,7 @@ def get_run(run_id):
 
 
 def excluir_run(run_id):
-    """Remove a run do SQLite e apaga a pasta de exportações (se existir)."""
+    """Exclui a execução do banco e limpa os arquivos dela, se existirem."""
     run = get_run(run_id)
     if not run:
         return False
@@ -229,11 +232,5 @@ def excluir_run(run_id):
         conn.commit()
     finally:
         conn.close()
-    pasta = run.get("pasta_export")
-    if pasta and isinstance(pasta, Path) and pasta.is_dir():
-        import shutil
-        try:
-            shutil.rmtree(pasta)
-        except Exception:
-            pass
+    _remover_pasta_exportacao(run.get("pasta_export"))
     return True
